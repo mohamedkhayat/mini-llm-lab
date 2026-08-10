@@ -1,0 +1,11 @@
+defaults:
+  - _self_
+  - data: default
+  - training: default
+  - model: gpt2
+
+hydra:
+  run:
+    dir: runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    name: ${training.exp_name,mini_llm}

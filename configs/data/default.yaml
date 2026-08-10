@@ -1,0 +1,19 @@
+source: files
+files:
+  - "data/*.txt"
+hf_dataset: null
+hf_config: null
+text_column: text
+split: train
+streaming: false
+tokenizer_name: gpt2
+seq_len: 1024
+stride: 512
+batch_size: 4
+val_ratio: 0.1
+shuffle: true
+drop_last: true
+num_workers: 4
+pin_memory: true
+persistent_workers: true
+seed: 42

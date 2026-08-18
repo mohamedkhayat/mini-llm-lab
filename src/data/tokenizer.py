@@ -1,5 +1,4 @@
 import tiktoken
-from typing import Final
 
 _CACHE: dict[str, tiktoken.Encoding] = {}
 

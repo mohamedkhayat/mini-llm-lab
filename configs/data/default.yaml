@@ -1,15 +1,19 @@
 source: files
+# The Verdict (small sample corpus, auto-downloaded to <project>/data/the_verdict)
 files:
-  - "data/*.txt"
+  - "data/the_verdict"
+max_files: null
 hf_dataset: null
 hf_config: null
 text_column: text
 split: train
 streaming: false
 tokenizer_name: gpt2
-seq_len: 1024
-stride: 512
-batch_size: 4
+# The Verdict is only ~5k tokens: seq_len must stay small or the val split
+# has zero samples (1024/512 -> 0 val samples -> crash).
+seq_len: 256
+stride: 128
+batch_size: 2
 val_ratio: 0.1
 shuffle: true
 drop_last: true

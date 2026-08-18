@@ -9,19 +9,30 @@ from data.dataset import GPTDataset, get_train_val_split
 from data.tokenizer import get_tokenizer
 
 
-def _load_text_from_files(files: list[str]) -> str:
-    """Glob ``files`` patterns, read every ``.txt``, concatenate."""
+def _load_text_from_files(
+    files: list[str], root: Path | None = None, max_files: int | None = None
+) -> str:
+    """Glob ``files`` patterns, read every ``.txt``, concatenate.
+
+    Patterns are resolved relative to ``root`` (defaults to the launch
+    directory) so they keep working after Hydra changes the cwd to the
+    run dir. ``max_files`` caps how many files are read (useful for huge
+    corpora like gutenberg).
+    """
+    root = Path.cwd() if root is None else root
     all_paths: list[str] = []
     for pattern in files:
-        all_paths.extend(glob.glob(pattern, recursive=True))
+        all_paths.extend(sorted(glob.glob(str(root / pattern), recursive=True)))
 
     if not all_paths:
-        raise FileNotFoundError(f"No files matched: {files}")
+        raise FileNotFoundError(f"No files matched: {files} (searched under {root})")
+
+    if max_files is not None:
+        all_paths = all_paths[:max_files]
 
     parts: list[str] = []
     for p in tqdm(all_paths, desc="Reading files"):
-        with open(p, "r", encoding="utf-8") as f:
-            parts.append(f.read())
+        parts.append(Path(p).read_text(encoding="utf-8"))
     return "\n".join(parts)
 
 
@@ -68,9 +79,15 @@ def _stream_chunks_to_string(ds, text_column: str) -> str:
     return "\n".join(parts)
 
 
-def _ensure_sample_data() -> str:
-    """Download the small sample corpus when no local files are available."""
-    verdict_path = Path("./data/the_verdict")
+def _ensure_sample_data(root: Path | None = None) -> str:
+    """Download the small sample corpus when no local files are available.
+
+    Cached under ``<root>/data/the_verdict`` so it is downloaded once and
+    reused across runs (the run dir is fresh every time, so a cwd-relative
+    path would re-download on every run).
+    """
+    root = Path.cwd() if root is None else root
+    verdict_path = root / "data" / "the_verdict"
     if not verdict_path.exists():
         import urllib.request
 
@@ -88,16 +105,36 @@ def _ensure_sample_data() -> str:
 def create_dataloaders(cfg) -> tuple[DataLoader, DataLoader]:
     """Create train and validation DataLoaders from a Hydra ``cfg.data`` node.
 
-    Supports two source types via ``cfg.data.source``:
+    Supports two source types via ``cfg.source``:
 
     - ``"files"``: local text files (glob patterns)
     - ``"hf_dataset"``: Hugging Face Hub dataset
+
+    File patterns are resolved against the launch directory (Hydra's
+    ``runtime.cwd``), not the run dir Hydra switches into, so relative
+    paths like ``data/gutenberg/data/text/*.txt`` keep working.
 
     Returns ``(train_loader, val_loader)``.
     """
     source = getattr(cfg, "source", "files")
     seed = int(getattr(cfg, "seed", 42))
     torch.manual_seed(seed)
+
+    if source not in {"files", "hf_dataset"}:
+        raise ValueError(
+            f"Unknown data source {source!r}; choose 'files' or 'hf_dataset'"
+        )
+
+    # Anchor file paths to the directory the user launched from, not the
+    # hydra run dir (which is fresh and empty every run).
+    try:
+        from hydra.core.hydra_config import HydraConfig
+
+        root = Path(HydraConfig.get().runtime.cwd)
+    except Exception:
+        root = Path.cwd()
+
+    max_files = int(getattr(cfg, "max_files", None) or 0) or None
 
     # --- Load raw text ---
     if source == "hf_dataset":
@@ -106,11 +143,11 @@ def create_dataloaders(cfg) -> tuple[DataLoader, DataLoader]:
         files = list(cfg.files) if cfg.files else []
         if files:
             try:
-                text = _load_text_from_files(files)
+                text = _load_text_from_files(files, root=root, max_files=max_files)
             except FileNotFoundError:
-                text = _ensure_sample_data()
+                text = _ensure_sample_data(root=root)
         else:
-            text = _ensure_sample_data()
+            text = _ensure_sample_data(root=root)
 
     # --- Tokenize ---
     tokenizer = get_tokenizer(cfg.tokenizer_name)
@@ -162,5 +199,11 @@ def create_dataloaders(cfg) -> tuple[DataLoader, DataLoader]:
         if nw > 0
         else False,
     )
+
+    if len(train_loader) == 0:
+        raise ValueError(
+            "The training DataLoader has no batches; reduce batch_size or "
+            "set drop_last=false."
+        )
 
     return train_loader, val_loader

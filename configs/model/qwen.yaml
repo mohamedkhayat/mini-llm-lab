@@ -1,4 +1,5 @@
 name: qwen
+attention: mha
 vocab_size: 152064
 context_length: 4096
 emb_dim: 896

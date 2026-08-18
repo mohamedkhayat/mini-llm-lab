@@ -2,7 +2,7 @@
 
 A small, from-scratch laboratory for learning how decoder-only language models
 work. The project is intentionally compact: it exposes the data pipeline,
-attention implementation, model configuration, and (eventually) training loop
+attention implementation, model configuration, and training loop
 without hiding the interesting parts behind a large framework.
 
 This is a learning and experimentation repository, not a production training
@@ -15,15 +15,14 @@ system or a package of pretrained models.
 - GPT-2 tokenization through `tiktoken`
 - Deterministic train/validation splitting
 - Causal multi-head self-attention in PyTorch
+- A GPT-2-style transformer model and training loop
+- W&B metrics, text samples, and Hydra-run checkpoints
 - Hydra configuration groups for GPT-2, Qwen-style, and Mixture-of-Experts
   experiments
-- A smoke-test entry point that loads data and prints batch shapes
 
-The complete transformer models, loss/optimizer loop, checkpointing, and text
-generation are still under construction. At present, `train.py` validates the
-configured data pipeline; it does not train a model yet. The files
-`src/models/gpt.py`, `src/models/qwen.py`, and `src/models/moe.py` are model
-placeholders.
+The GPT-2-style model is currently wired into `train.py`. The Qwen-style and
+Mixture-of-Experts files describe planned variants; all three configs currently
+instantiate the same `GptModel` implementation with different dimensions.
 
 ## Project layout
 
@@ -32,13 +31,13 @@ mini-llm-lab/
 ├── configs/                 # Composable Hydra configuration
 │   ├── data/                # Local-file and Hugging Face inputs
 │   ├── model/               # GPT-2, Qwen-style, and MoE settings
-│   └── training/            # Future training-loop settings
+│   └── training/            # Optimizer and run settings
 ├── src/
 │   ├── data/                # Tokenization, datasets, and dataloaders
-│   └── models/
-│       └── attention/       # Causal multi-head attention
+│   ├── models/              # GPT model and transformer components
+│   └── training/            # Training loop and checkpointing
 ├── tests/                   # Pytest tests
-└── train.py                 # Data-pipeline smoke test
+└── train.py                 # Hydra training entry point
 ```
 
 ## Setup
@@ -56,9 +55,12 @@ PyTorch is installed using its default package-index build. If you need a
 specific CUDA build, install PyTorch using the command recommended for your
 system, then install this project.
 
-## Try the data pipeline
+## Run training
 
-Put one or more sufficiently large UTF-8 text files under `data/`:
+The default data config uses the small *The Verdict* corpus at
+`data/the_verdict`. If it is missing, the loader downloads it automatically.
+For a larger local corpus, put UTF-8 text files under `data/` and override the
+`data.files` setting.
 
 ```text
 data/
@@ -66,26 +68,35 @@ data/
 └── book-two.txt
 ```
 
-Then run:
+Select those files with a Hydra override:
+
+```bash
+python train.py 'data.files=[data/book-one.txt,data/book-two.txt]'
+```
+
+For a normal GPU run:
 
 ```bash
 python train.py
 ```
 
-By default, files matching `data/*.txt` are concatenated, tokenized, split 90/10,
-and converted into overlapping sequences of 1,024 tokens. The program prints
-the resolved configuration, corpus sizes, and the shape of one training batch.
+The trainer tokenizes the corpus, splits it 90/10, creates overlapping
+next-token windows, and trains the GPT-style model. W&B logs online by default;
+use `WANDB_MODE=offline` for local logging or `WANDB_MODE=disabled` to skip W&B.
 
-For a small corpus, reduce the sequence length and worker count:
+For a quick CPU smoke test, reduce the model and data sizes:
 
 ```bash
-python train.py data.seq_len=128 data.stride=64 data.batch_size=2 data.num_workers=0
+WANDB_MODE=disabled python train.py \
+  model.emb_dim=128 model.n_heads=4 model.n_layers=2 model.context_length=128 \
+  data.seq_len=128 data.stride=64 data.batch_size=2 data.num_workers=0 \
+  training.device=cpu training.epochs=1 training.eval_interval=20 \
+  training.eval_batches=2 training.max_new_tokens=2
 ```
 
-If `data/*.txt` matches nothing, the loader attempts to download the small
-*The Verdict* sample corpus. Because that corpus is small, use the reduced
-sequence-length command above so both the training and validation splits contain
-at least one window.
+The sample corpus is intentionally small, so use a reduced sequence length.
+Training data files and generated experiment outputs are local-only and ignored
+by Git.
 
 ### Use a Hugging Face dataset
 
@@ -110,15 +121,21 @@ Dataset downloads require internet access. The current streaming option avoids
 the Hugging Face download materialization step, but still concatenates all text
 in memory before tokenization.
 
+For the Project Gutenberg preset, cap the number of books while experimenting:
+
+```bash
+python train.py data=gutenberg data.max_files=10 data.num_workers=0
+```
+
 ## Configuration
 
 Hydra composes the defaults in `configs/config.yaml` from three groups:
 
 | Group | Default | Alternatives | Purpose |
 | --- | --- | --- | --- |
-| `data` | `default` | `hf_dataset` | Corpus, tokenizer, windows, and loaders |
-| `model` | `gpt2` | `qwen`, `moe` | Architecture parameters for future models |
-| `training` | `default` | — | Optimizer and run settings for the future loop |
+| `data` | `default` | `hf_dataset`, `gutenberg` | Corpus, tokenizer, windows, and loaders |
+| `model` | `gpt2` | `qwen`, `moe` | Model dimensions and planned architecture variants |
+| `training` | `default` | — | Optimizer, evaluation, and run settings |
 
 Values can be changed from the command line without editing YAML:
 
@@ -126,9 +143,9 @@ Values can be changed from the command line without editing YAML:
 python train.py model=qwen data.batch_size=8 data.seq_len=512 training.device=cpu
 ```
 
-Hydra writes run output beneath `runs/YYYY-MM-DD/HH-MM-SS/`. Selecting a model
-configuration currently changes only the printed configuration because model
-construction has not yet been wired into `train.py`.
+Hydra writes run output beneath `runs/YYYY-MM-DD/HH-MM-SS/`. A validation run
+can write `best.pt` there; periodic checkpoints are enabled with
+`training.save_interval=<steps>`.
 
 ## Data behavior
 
@@ -143,7 +160,15 @@ The pipeline performs the following steps:
 
 `stride` controls overlap. A stride equal to `seq_len` creates adjacent windows;
 a smaller stride creates overlapping examples. The corpus must be large enough
-for at least one full window in both splits.
+for at least one full window in both splits and, when `drop_last=true`, at least
+one complete training batch.
+
+## Outputs
+
+- W&B metrics include training/validation loss, perplexity, learning rate,
+  throughput, and generated text samples.
+- Hydra stores run metadata and checkpoints under `runs/`.
+- `runs/`, `wandb/`, and `checkpoints/` are ignored by Git.
 
 ## Tests
 
@@ -156,11 +181,11 @@ finiteness, and batch consistency.
 
 ## Roadmap
 
-- Implement the GPT-2-style transformer stack
+- Expand the GPT-2-style transformer stack
 - Add Qwen-style grouped-query attention, RoPE, RMSNorm, and SwiGLU
 - Add sparse Mixture-of-Experts routing
-- Wire model construction into the Hydra configs
-- Implement training, evaluation, checkpoints, and text generation
+- Add a model factory for the Qwen and MoE configurations
+- Add checkpoint resume and richer evaluation controls
 - Expand unit and integration coverage
 
 ## License

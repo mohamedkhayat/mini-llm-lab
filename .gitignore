@@ -219,3 +219,8 @@ __marimo__/
 
 # Local datasets
 /data/
+
+# Training and experiment outputs
+runs/
+wandb/
+checkpoints/

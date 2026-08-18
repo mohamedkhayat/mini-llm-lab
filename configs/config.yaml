@@ -7,5 +7,3 @@ defaults:
 hydra:
   run:
     dir: runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
-  job:
-    name: ${training.exp_name,mini_llm}

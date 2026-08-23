@@ -8,7 +8,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import wandb
 from omegaconf import OmegaConf
 from torch.nn.utils import clip_grad_norm_
 
@@ -24,6 +23,11 @@ from training.checkpointing import (
     resolve_resume_path,
     restore_model,
     restore_training_state,
+)
+from training.log_backend import (
+    build_artifact_metadata,
+    create_logger,
+    resolve_log_backend,
 )
 from training.run_manifest import (
     config_digest,
@@ -75,70 +79,6 @@ def get_model_parameter_metrics(model):
         "model/parameter_memory_bytes": parameter_bytes,
         "model/parameter_memory_mb": parameter_bytes / 1024**2,
     }
-
-
-def resolve_log_backend(training_cfg, wandb_mode=None):
-    """Resolve whether metrics should be sent to W&B or the terminal."""
-    configured_backend = getattr(training_cfg, "log_backend", "wandb")
-    if configured_backend is None:
-        configured_backend = "wandb"
-
-    aliases = {"term": "terminal", "console": "terminal"}
-    normalized_backend = str(configured_backend).strip().lower()
-    log_backend = aliases.get(normalized_backend, normalized_backend)
-    if log_backend not in {"wandb", "terminal"}:
-        raise ValueError(
-            "training.log_backend must be either 'wandb' or 'terminal'; "
-            f"got {configured_backend!r}"
-        )
-
-    # Keep the existing WANDB_MODE=disabled escape hatch useful even when the
-    # config still has its default backend.
-    selected_wandb_mode = (
-        os.environ.get("WANDB_MODE", "") if wandb_mode is None else wandb_mode
-    )
-    if str(selected_wandb_mode).strip().lower() == "disabled":
-        return "terminal"
-    return log_backend
-
-
-def should_log_artifacts(log_backend) -> bool:
-    """W&B artifacts are only meaningful when W&B is the logging backend."""
-    return log_backend == "wandb"
-
-
-def build_artifact_metadata(
-    kind, stage, step, tokens_seen, best_val_loss, git_commit, local_path, wandb_run_id
-):
-    """Identifying metadata attached to a checkpoint W&B artifact."""
-    return {
-        "kind": kind,
-        "stage": stage,
-        "step": step,
-        "tokens_seen": tokens_seen,
-        "best_val_loss": best_val_loss,
-        "git_commit": git_commit,
-        "local_path": local_path,
-        "wandb_run_id": wandb_run_id,
-    }
-
-
-def log_artifact(wandb, path, name, metadata) -> bool:
-    """Upload ``path`` to W&B as artifact ``name`` with ``metadata``.
-
-    Never raises: an artifact failure (connection drop, server error) only
-    prints a warning so it cannot abort a long training run. Returns True
-    when the artifact was logged.
-    """
-    try:
-        artifact = wandb.Artifact(name, type="models")
-        artifact.add_file(str(path))
-        artifact.metadata.update(metadata)
-        wandb.log_artifact(artifact)
-        return True
-    except Exception as error:
-        print(f"Warning: failed to log W&B artifact {name!r}: {error}")
-        return False
 
 
 class Trainer:
@@ -210,7 +150,6 @@ class Trainer:
         self.train_loader, self.val_loader = create_dataloaders(cfg.data)
 
         self.log_backend = resolve_log_backend(cfg.training)
-        self.use_wandb = self.log_backend == "wandb"
         self.step = 0
         self.best_val_loss = float("inf")
         self.epoch = 0
@@ -353,60 +292,30 @@ class Trainer:
                 # the checkpoint's exact current LR wins.
                 self.optimizer.load_state_dict(optimizer_state)
 
-        if self.use_wandb:
-            wandb_config = OmegaConf.to_container(cfg, resolve=True)
-            wandb_name = cfg.training.exp_name
-            if self.resume_checkpoint is not None:
-                saved_cfg = self.resume_checkpoint.get("cfg")
-                if isinstance(saved_cfg, dict):
-                    # Keep the resumed run's original configuration in W&B;
-                    # the resume path itself is an invocation detail, not a
-                    # new experiment configuration.
-                    wandb_config = saved_cfg
-                    saved_training_cfg = saved_cfg.get("training", {})
-                    wandb_name = saved_training_cfg.get(
-                        "exp_name", wandb_name
-                    )
-            wandb_kwargs = {
-                "project": "mini-llm-lab",
-                "name": wandb_name,
-                "config": wandb_config,
-            }
-            if self.wandb_run_id is not None:
-                wandb_kwargs.update(id=self.wandb_run_id, resume="must")
-                print(f"Resuming W&B run: {self.wandb_run_id}")
-            wandb.init(**wandb_kwargs)
-            if wandb.run is not None:
-                self.wandb_run_id = wandb.run.id
-            stage_marker = {"training_stage": self.stage_label}
-            if self.wsd_decay["triggered"]:
-                stage_marker["wsd_trigger_step"] = self.wsd_decay["step"]
-            wandb.config.update(
-                {
-                    "computed_steps_per_epoch": self.steps_per_epoch,
-                    "computed_total_steps": self.total_steps,
-                    "computed_tokens_per_step": self.tokens_per_step,
-                    "computed_total_train_tokens": self.total_train_tokens,
-                    "computed_budget_name": self.budget_name,
-                    **stage_marker,
-                    "model_parameters_total": self.model_parameter_metrics[
-                        "model/parameters_total"
-                    ],
-                    "model_parameters_trainable": self.model_parameter_metrics[
-                        "model/parameters_trainable"
-                    ],
-                    "model_parameters_non_trainable": self.model_parameter_metrics[
-                        "model/parameters_non_trainable"
-                    ],
-                    "model_parameter_memory_mb": self.model_parameter_metrics[
-                        "model/parameter_memory_mb"
-                    ],
-                }
-            )
-            wandb.log(
-                {**self.model_parameter_metrics, "step": self.step},
-                step=self.step,
-            )
+        # --- Log backend: one adapter per backend, resolved above ---
+        self.logger = create_logger(self.log_backend)
+        stage_marker = {"training_stage": self.stage_label}
+        if self.wsd_decay["triggered"]:
+            stage_marker["wsd_trigger_step"] = self.wsd_decay["step"]
+        saved_cfg = (
+            self.resume_checkpoint.get("cfg") if self.resume_checkpoint is not None else None
+        )
+        self.logger.init(
+            name=self.run_name,
+            config=OmegaConf.to_container(cfg, resolve=True),
+            saved_config=saved_cfg if isinstance(saved_cfg, dict) else None,
+            computed={
+                "computed_steps_per_epoch": self.steps_per_epoch,
+                "computed_total_steps": self.total_steps,
+                "computed_tokens_per_step": self.tokens_per_step,
+                "computed_total_train_tokens": self.total_train_tokens,
+                "computed_budget_name": self.budget_name,
+            },
+            stage_marker=stage_marker,
+            parameter_metrics=self.model_parameter_metrics,
+            step=self.step,
+            resumed_run_id=self.wandb_run_id,
+        )
 
     def _print_model_summary(self):
         """Print model size and architecture metadata for terminal runs."""
@@ -577,19 +486,11 @@ class Trainer:
             )
         text = token_ids_to_text(token_ids, self.tokenizer).replace("\n", " ")
         self.model.train()
-        if self.use_wandb:
-            wandb.log(
-                {"sample_text": wandb.Html(f"<pre>{text}</pre>"), "step": self.step},
-                step=self.step,
-            )
-        else:
-            loss_text = "loss n/a" if loss is None else f"val loss {loss:.4f}"
-            print(f"sample | step {self.step} | {loss_text} | text: {text}")
+        self.logger.log_sample(text, step=self.step, loss=loss)
 
     def _log_metrics(self, metrics):
-        """Send metrics to W&B when it is the selected logging backend."""
-        if self.use_wandb:
-            wandb.log(metrics, step=self.step)
+        """Log metrics through the run's log backend adapter."""
+        self.logger.log_metrics(metrics, self.step)
 
     def train_step(self, x, y):
         """Run one optimization step and return the scalar loss."""
@@ -654,9 +555,7 @@ class Trainer:
     def _record_manifest(self, kind, filename):
         """Record a checkpoint save in the run manifest (never fatal)."""
         try:
-            wandb_url = None
-            if self.use_wandb and wandb.run is not None:
-                wandb_url = getattr(wandb.run, "url", None)
+            wandb_url = self.logger.run_url
             entry = make_entry(
                 file=filename,
                 kind=kind,
@@ -681,17 +580,13 @@ class Trainer:
             print(f"Warning: failed to update the run manifest: {error}")
 
     def _log_checkpoint_artifact(self, kind, name, path):
-        """Upload a saved checkpoint as a W&B artifact (W&B backend only).
-
-        Failures inside ``log_artifact`` are non-fatal by design; terminal
-        mode performs no W&B interaction at all.
-        """
-        if not should_log_artifacts(self.log_backend):
-            return
-        log_artifact(
-            wandb,
-            path,
+        """Record a saved checkpoint in the log backend (the W&B adapter
+        uploads it as an artifact; terminal mode performs no W&B
+        interaction). Failures are non-fatal by design."""
+        self.logger.log_checkpoint(
+            kind,
             name,
+            path,
             build_artifact_metadata(
                 kind=kind,
                 stage=self.stage_label,
@@ -862,7 +757,7 @@ class Trainer:
                                 "step": self.step,
                             }
                         )
-                        if not self.use_wandb:
+                        if self.log_backend != "wandb":
                             print(
                                 f"eval | step {self.step} | train loss {train_loss:.4f} | "
                                 f"val loss {val_loss:.4f}"
@@ -935,6 +830,5 @@ class Trainer:
             self.close()
 
     def close(self):
-        """Flush and close the W&B run when W&B logging is enabled."""
-        if self.use_wandb and wandb.run is not None:
-            wandb.finish()
+        """Flush and close the run's log backend."""
+        self.logger.finish()

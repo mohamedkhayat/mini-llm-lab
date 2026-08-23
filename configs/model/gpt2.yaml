@@ -1,17 +1,23 @@
 name: gpt2
 attention: mha
+tie_embeddings: true
 vocab_size: 50257
 context_length: 1024
 emb_dim: 768
+hidden_dim: 3072
 n_heads: 12
 n_kv_heads: 12
 n_layers: 12
 drop_rate: 0.1
 qkv_bias: false
+ffn_bias: false
 norm: layernorm
 activation: gelu
+gated: false
+equalize_params: true
 position_embedding: absolute
 residual_style: serial
-ff_mult: 4
 logit_softcap: null
 rope_theta: null
+temperature : 1.0
+top_k : 25

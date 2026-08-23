@@ -11,12 +11,18 @@ system or a package of pretrained models.
 ## What is implemented
 
 - GPT-style next-token datasets built from sliding windows
-- Local text-file and Hugging Face dataset inputs
+- Local text-file and Hugging Face dataset inputs, plus memory-mapped token
+  caches for large corpora
 - GPT-2 tokenization through `tiktoken`
-- Deterministic train/validation splitting
-- Causal multi-head self-attention in PyTorch
-- A GPT-2-style transformer model and training loop
-- W&B metrics, text samples, and Hydra-run checkpoints
+- Deterministic train/validation splitting with epoch-deterministic sampling
+  for exact resume
+- Causal attention backends: multi-head, fast SDPA, and grouped-query attention
+- Configurable feed-forward: activation by name and optional gated
+  SwiGLU-style projections
+- Optional tied input/output embeddings
+- A GPT-2-style transformer model and training loop (schedule, checkpointing,
+  and log backend as separate modules)
+- W&B or terminal metrics, text samples, artifacts, and Hydra-run checkpoints
 - Hydra configuration groups for GPT-2, Qwen-style, and Mixture-of-Experts
   experiments
 
@@ -33,9 +39,9 @@ mini-llm-lab/
 │   ├── model/               # GPT-2, Qwen-style, and MoE settings
 │   └── training/            # Optimizer and run settings
 ├── src/
-│   ├── data/                # Tokenization, datasets, and dataloaders
-│   ├── models/              # GPT model and transformer components
-│   └── training/            # Training loop and checkpointing
+│   ├── data/                # Tokenization, datasets, dataloaders, token caches
+│   ├── models/              # GPT model, attention backends, FFN, normalization
+│   └── training/            # Training loop, LR schedule, checkpointing, log backend
 ├── tests/                   # Pytest tests
 └── train.py                 # Hydra training entry point
 ```
@@ -227,11 +233,13 @@ the whole chosen budget.
 | `model.n_layers` | `12` | Number of transformer blocks. |
 | `model.drop_rate` | `0.1` | Dropout probability used in embeddings, attention, and residual blocks. |
 | `model.qkv_bias` | `false` | Add bias terms to query, key, and value projections. |
-| `model.norm` | `layernorm` | Normalization label in the config. The current `GptModel` implementation uses its LayerNorm implementation regardless of this label. |
-| `model.activation` | `gelu` | Activation label in the config. The current feed-forward block uses GELU; other labels are not yet dispatched. |
+| `model.norm` | `layernorm` | Normalization label in the config. The current `GptModel` implementation uses its LayerNorm implementation regardless of this label; an `RMSNorm` module exists under `src/models/normalization/` but is not dispatched yet. |
+| `model.activation` | `gelu` | Feed-forward activation, dispatched by name: `gelu`, `silu`, or `sigmoid`. |
+| `model.hidden_dim` | `3072` | Feed-forward hidden width. With `gated=true`, `equalize_params=true` shrinks it to two-thirds so the three gated matrices match the parameter count of the ungated width. |
+| `model.gated` | `false` | Use a gated SwiGLU-style feed-forward: a second upcast projection multiplies the activated hidden stream elementwise. |
+| `model.ffn_bias` | `false` | Add bias terms to the feed-forward linear layers. |
 | `model.position_embedding` | `absolute` | Position-encoding label. The active GPT implementation uses learned absolute positional embeddings; RoPE is not yet dispatched. |
 | `model.residual_style` | `serial` | Residual-layout label. The active transformer block uses serial pre-norm residual connections. |
-| `model.ff_mult` | `4` | Feed-forward hidden width multiplier: `emb_dim * ff_mult`. |
 | `model.logit_softcap` | `null` | Reserved config field; not currently applied by the GPT implementation. |
 | `model.rope_theta` | `null` | Reserved RoPE parameter; not used while absolute positional embeddings are active. |
 | `model.temperature` | `1.0` | Temperature for periodic sample generation. Positive values sample from the distribution; `0` or a negative value uses greedy argmax. |
@@ -240,9 +248,11 @@ the whole chosen budget.
 The `moe` preset also contains `num_experts`,
 `num_experts_per_token`, and `shared_expert` fields. They describe planned
 Mixture-of-Experts behavior but are not consumed by the current `GptModel`.
-Likewise, the Qwen-style labels (`rmsnorm`, `swiglu`, and `rope`) are config
-metadata rather than active implementations. Use `model=gpt2` for the
-supported end-to-end training path until a model factory is added.
+Likewise, the Qwen-style `rmsnorm` and `rope` labels are config
+metadata rather than active implementations; its gated SiLU feed-forward,
+grouped-query attention dimensions, and tied embeddings are real. Use
+`model=gpt2` for the supported end-to-end training path until a model
+factory is added.
 
 | Parameter | MoE default | Description |
 | --- | --- | --- |
@@ -509,13 +519,16 @@ pytest
 ```
 
 The test suite covers causal attention, model-config validation, token-shard
-datasets, checkpoint state, and the training schedule (including the WSD
-two-stage budget, resume consistency, the run manifest, and W&B artifacts).
+datasets, checkpoint state, the training schedule (including the WSD two-stage
+budget, resume consistency, the run manifest, and W&B artifacts), and six
+end-to-end training-loop behaviors (budget stop, signal/KeyboardInterrupt
+stops, best-checkpoint improvement, periodic saves, and resume cursor) driven
+on a stub-constructed trainer without GPU, W&B, or corpora.
 
 ## Roadmap
 
 - Expand the GPT-2-style transformer stack
-- Add Qwen-style grouped-query attention, RoPE, RMSNorm, and SwiGLU
+- Add RoPE and dispatch RMSNorm (the module exists but is not wired in)
 - Add sparse Mixture-of-Experts routing
 - Add a model factory for the Qwen and MoE configurations
 - Add richer evaluation controls

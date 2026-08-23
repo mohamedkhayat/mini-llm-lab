@@ -11,6 +11,7 @@ dependencies = [
     "datasets>=2.14",
     "numpy>=1.26",
     "wandb>=0.17",
+    "chainlit>=2.11",
 ]
 
 [project.optional-dependencies]

@@ -1,7 +1,7 @@
 import pytest
 
+from training.checkpointing import check_resume_consistency
 from training.schedule import resolve_wsd_state, stage_label
-from training.trainer import check_resume_consistency
 
 
 def test_fresh_flag_triggers_the_decay_at_the_resume_step():

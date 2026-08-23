@@ -1,4 +1,3 @@
-import io
 import math
 import os
 import random
@@ -16,8 +15,17 @@ from torch.nn.utils import clip_grad_norm_
 from data.dataloader import create_dataloaders
 from data.tokenizer import get_tokenizer, text_to_token_ids, token_ids_to_text
 from models.gpt import GptModel
+from training.checkpointing import (
+    RunState,
+    atomic_torch_save,
+    build_checkpoint_payload,
+    check_resume_consistency,
+    load_checkpoint,
+    resolve_resume_path,
+    restore_model,
+    restore_training_state,
+)
 from training.run_manifest import (
-    atomic_write_bytes,
     config_digest,
     git_commit,
     make_entry,
@@ -94,79 +102,6 @@ def resolve_log_backend(training_cfg, wandb_mode=None):
     return log_backend
 
 
-def check_resume_consistency(
-    saved_total_steps, total_steps, saved_steps_per_epoch, steps_per_epoch, decay_run
-):
-    """Validate resume compatibility between a checkpoint and the new config.
-
-    Decay runs are exempt from the total-steps check: stage 2 re-derives its
-    budget from the trigger step, so the configured budget may differ from
-    stage 1's. The steps-per-epoch check always applies because stage 2 must
-    keep the original data settings.
-    """
-    if (
-        saved_total_steps is not None
-        and int(saved_total_steps) != int(total_steps)
-        and not decay_run
-    ):
-        raise ValueError(
-            "The resume config produces a different total step budget "
-            f"({int(total_steps)}) than the checkpoint ({int(saved_total_steps)}). "
-            "Resume with the original training budget for an exact continuation."
-        )
-    if saved_steps_per_epoch is not None and int(saved_steps_per_epoch) != int(steps_per_epoch):
-        raise ValueError(
-            "The resumed dataloader has a different number of batches per "
-            "data pass. Keep the original data, seq_len, stride, batch_size, "
-            "and drop_last settings for an exact continuation."
-        )
-
-
-def build_checkpoint_payload(
-    model_state,
-    model_cfg,
-    optimizer_state,
-    scheduler_state,
-    step,
-    best_val_loss,
-    cursor,
-    tokens_seen,
-    run_elapsed_seconds,
-    steps_per_epoch,
-    tokens_per_step,
-    total_steps,
-    wandb_run_id,
-    rng_state,
-    cfg_container,
-    wsd_state,
-):
-    """Assemble the restart-complete checkpoint payload (plain dict).
-
-    The live WSD state (``wsd``) is persisted alongside the scheduler so a
-    crash mid-decay resumes from the original trigger step; legacy
-    checkpoints without the key are tolerated on resume.
-    """
-    return {
-        "checkpoint_version": 2,
-        "model": model_state,
-        "model_cfg": model_cfg,
-        "optimizer": optimizer_state,
-        "scheduler": scheduler_state,
-        "step": step,
-        "best_val_loss": best_val_loss,
-        "cursor": cursor,
-        "tokens_seen": tokens_seen,
-        "run_elapsed_seconds": run_elapsed_seconds,
-        "steps_per_epoch": steps_per_epoch,
-        "tokens_per_step": tokens_per_step,
-        "total_steps": total_steps,
-        "wandb_run_id": wandb_run_id,
-        "rng": rng_state,
-        "cfg": cfg_container,
-        "wsd": wsd_state,
-    }
-
-
 def should_log_artifacts(log_backend) -> bool:
     """W&B artifacts are only meaningful when W&B is the logging backend."""
     return log_backend == "wandb"
@@ -204,53 +139,6 @@ def log_artifact(wandb, path, name, metadata) -> bool:
     except Exception as error:
         print(f"Warning: failed to log W&B artifact {name!r}: {error}")
         return False
-
-
-def _launch_directory() -> Path:
-    """Return the directory from which Hydra launched the job."""
-    try:
-        from hydra.core.hydra_config import HydraConfig
-
-        return Path(HydraConfig.get().runtime.cwd)
-    except Exception:
-        return Path.cwd()
-
-
-def resolve_resume_path(training_cfg) -> Path | None:
-    """Resolve an explicit checkpoint path or the newest ``latest.pt``."""
-    configured_path = getattr(training_cfg, "resume_from", None)
-    if configured_path in (None, "", False):
-        return None
-
-    configured_path = str(configured_path)
-    root = _launch_directory()
-    if configured_path.lower() in {"latest", "auto"}:
-        candidates = list(root.rglob("latest.pt"))
-        if not candidates:
-            raise FileNotFoundError(f"No latest.pt checkpoint found below {root}")
-        return max(candidates, key=lambda path: path.stat().st_mtime)
-
-    path = Path(configured_path)
-    if not path.is_absolute():
-        path = root / path
-    if not path.is_file():
-        raise FileNotFoundError(f"Resume checkpoint does not exist: {path}")
-    return path
-
-
-def load_checkpoint(path: Path) -> dict:
-    """Load a checkpoint on CPU so it can be restored before device setup."""
-    try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:  # PyTorch versions before the ``weights_only`` keyword.
-        return torch.load(path, map_location="cpu")
-
-
-def atomic_torch_save(payload: dict, path: str | os.PathLike) -> None:
-    """Write a checkpoint atomically and make the directory entry durable."""
-    buffer = io.BytesIO()
-    torch.save(payload, buffer)
-    atomic_write_bytes(path, buffer.getvalue())
 
 
 class Trainer:
@@ -538,71 +426,36 @@ class Trainer:
         )
 
     def _restore_model(self, checkpoint):
-        """Load plain or compiled-module state into the uncompiled model."""
-        state = checkpoint.get("model") or checkpoint.get("model_state_dict")
-        if state is None:
-            raise KeyError("Checkpoint does not contain a model state dictionary")
-
-        normalized_state = {
-            key.removeprefix("_orig_mod."): value for key, value in state.items()
-        }
-        missing, unexpected = self.model.load_state_dict(
-            normalized_state, strict=False
-        )
-        if missing or unexpected:
-            raise RuntimeError(
-                "Checkpoint model does not match the configured architecture: "
-                f"missing={missing}, unexpected={unexpected}"
-            )
+        """Load the checkpoint's weights into the freshly built model."""
+        restore_model(self.model, checkpoint)
 
     def _restore_training_state(self, checkpoint):
-        """Restore counters, cursor, W&B identity, and all RNG streams."""
-        self.step = int(checkpoint.get("step", 0))
-        self.best_val_loss = float(
-            checkpoint.get("best_val_loss", float("inf"))
+        """Restore counters, cursor, W&B identity, and all RNG streams.
+
+        The live state is handed to ``restore_training_state`` as a
+        :class:`RunState` bundle and read back afterwards.
+        """
+        bundle = RunState(
+            step=self.step,
+            best_val_loss=self.best_val_loss,
+            wandb_run_id=self.wandb_run_id,
+            run_elapsed_seconds=self.run_elapsed_seconds,
+            epoch=self.epoch,
+            batch_in_epoch=self.batch_in_epoch,
+            tokens_seen=self.tokens_seen,
+            steps_per_epoch=self.steps_per_epoch,
+            tokens_per_step=self.tokens_per_step,
+            train_loader=self.train_loader,
+            val_loader=self.val_loader,
         )
-        self.wandb_run_id = checkpoint.get("wandb_run_id")
-        self.run_elapsed_seconds = float(checkpoint.get("run_elapsed_seconds", 0.0))
-
-        cursor = checkpoint.get("cursor")
-        if cursor is None:
-            # Old checkpoints can still be loaded, but they do not contain
-            # enough information for an exact continuation.
-            self.epoch, self.batch_in_epoch = divmod(
-                self.step, self.steps_per_epoch
-            )
-        else:
-            self.epoch = int(cursor.get("epoch", 0))
-            self.batch_in_epoch = int(cursor.get("batch_in_epoch", 0))
-
-        saved_tokens = checkpoint.get("tokens_seen")
-        self.tokens_seen = (
-            int(saved_tokens)
-            if saved_tokens is not None
-            else self.step * self.tokens_per_step
-        )
-
-        rng_state = checkpoint.get("rng")
-        if rng_state is None:
-            print(
-                "Warning: checkpoint has no RNG/data-cursor state; the model and "
-                "optimizer will resume, but this legacy checkpoint is not bit-for-bit."
-            )
-        else:
-            random.setstate(rng_state["python"])
-            np.random.set_state(rng_state["numpy"])
-            torch.set_rng_state(rng_state["torch"])
-            if torch.cuda.is_available() and rng_state.get("cuda") is not None:
-                torch.cuda.set_rng_state_all(rng_state["cuda"])
-            dataloader_rng = rng_state.get("dataloader", {})
-            train_generator = getattr(self.train_loader, "generator", None)
-            val_generator = getattr(self.val_loader, "generator", None)
-            if train_generator is not None and dataloader_rng.get("train") is not None:
-                train_generator.set_state(dataloader_rng["train"])
-            if val_generator is not None and dataloader_rng.get("val") is not None:
-                val_generator.set_state(dataloader_rng["val"])
-
-        self._set_train_epoch(self.epoch)
+        restore_training_state(bundle, checkpoint)
+        self.step = bundle.step
+        self.best_val_loss = bundle.best_val_loss
+        self.wandb_run_id = bundle.wandb_run_id
+        self.run_elapsed_seconds = bundle.run_elapsed_seconds
+        self.epoch = bundle.epoch
+        self.batch_in_epoch = bundle.batch_in_epoch
+        self.tokens_seen = bundle.tokens_seen
 
     def _set_train_epoch(self, epoch):
         """Set the deterministic sampler to the logical data-pass number."""

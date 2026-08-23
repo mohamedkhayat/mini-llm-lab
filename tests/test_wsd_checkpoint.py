@@ -1,4 +1,4 @@
-from training.trainer import (
+from training.checkpointing import (
     atomic_torch_save,
     build_checkpoint_payload,
     load_checkpoint,

@@ -224,3 +224,10 @@ __marimo__/
 runs/
 wandb/
 checkpoints/
+
+# Local tooling & learning working files (never committed)
+.chainlit/
+.scratch/
+.agents/
+.codex/
+LEARNING_LOG.md

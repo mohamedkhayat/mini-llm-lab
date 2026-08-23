@@ -1,4 +1,5 @@
 import torch.nn as nn
+from models.attention.gqa import GroupQueryAttention
 from models.normalization.layerNorm import LayerNorm
 from models.attention.mha import MultiHeadAttention
 from models.attention.fastmha import FastMultiHeadAttention
@@ -17,6 +18,7 @@ class TransformerBlock(nn.Module):
         attention_impls = {
             "mha": MultiHeadAttention,
             "fastmha": FastMultiHeadAttention,
+            "gqa" : GroupQueryAttention
         }
         if attention_name not in attention_impls:
             choices = ", ".join(sorted(attention_impls))
@@ -31,6 +33,7 @@ class TransformerBlock(nn.Module):
             cfg.context_length,
             cfg.drop_rate,
             cfg.n_heads,
+            cfg.n_kv_heads,
             cfg.qkv_bias,
         )
         self.ffn = FeedForward(cfg)

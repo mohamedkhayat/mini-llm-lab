@@ -10,6 +10,7 @@ class MultiHeadAttention(nn.Module):
         context_length,
         dropout,
         num_heads,
+        num_kv_groups,
         qkv_bias=False,
     ):
         super().__init__()

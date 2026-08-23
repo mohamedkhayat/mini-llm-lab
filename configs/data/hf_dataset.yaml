@@ -1,5 +1,6 @@
 source: hf_dataset
 files: []
+tokenized_dir: null
 hf_dataset: wikitext
 hf_config: wikitext-2-raw-v1
 text_column: text

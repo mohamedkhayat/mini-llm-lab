@@ -1,9 +1,10 @@
 source: files
-# Project Gutenberg (51k books, ~19GB). max_files caps how many are read —
-# each book is a separate .txt, so this is a cheap way to scale the corpus.
+# Project Gutenberg (51k books, ~19GB). max_files caps raw-loader reads.
+# For the entire corpus, build a token cache and set tokenized_dir instead.
 files:
   - "data/gutenberg/data/text/*.txt"
 max_files: 200
+tokenized_dir: null
 hf_dataset: null
 hf_config: null
 text_column: text

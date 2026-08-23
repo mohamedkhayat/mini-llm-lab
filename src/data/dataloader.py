@@ -2,7 +2,7 @@ import glob
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 
 from data.dataset import GPTDataset, get_train_val_split
@@ -134,6 +134,35 @@ def create_dataloaders(cfg) -> tuple[DataLoader, DataLoader]:
     except Exception:
         root = Path.cwd()
 
+    tokenized_dir = getattr(cfg, "tokenized_dir", None)
+    if tokenized_dir:
+        from data.token_shards import TokenShardDataset, load_manifest
+
+        cache_dir = Path(tokenized_dir)
+        if not cache_dir.is_absolute():
+            cache_dir = root / cache_dir
+        manifest = load_manifest(cache_dir)
+        print(
+            f"Using tokenized cache: {cache_dir} "
+            f"({manifest['total_tokens']:,} tokens, "
+            f"{len(manifest['shards']):,} shards)"
+        )
+        train_ds = TokenShardDataset(
+            cache_dir,
+            seq_len=int(cfg.seq_len),
+            stride=int(getattr(cfg, "stride", cfg.seq_len)),
+            split="train",
+            tokenizer_name=str(cfg.tokenizer_name),
+        )
+        val_ds = TokenShardDataset(
+            cache_dir,
+            seq_len=int(cfg.seq_len),
+            stride=int(getattr(cfg, "stride", cfg.seq_len)),
+            split="val",
+            tokenizer_name=str(cfg.tokenizer_name),
+        )
+        return _create_dataloaders_from_datasets(train_ds, val_ds, cfg)
+
     max_files = int(getattr(cfg, "max_files", None) or 0) or None
 
     # --- Load raw text ---
@@ -172,14 +201,63 @@ def create_dataloaders(cfg) -> tuple[DataLoader, DataLoader]:
         )
     print(f"Train steps: {len(train_ds):,} | Val steps: {len(val_ds):,}")
 
+    return _create_dataloaders_from_datasets(train_ds, val_ds, cfg)
+
+
+class EpochRandomSampler(Sampler[int]):
+    """Deterministically shuffle a dataset once per logical data pass.
+
+    ``DataLoader(shuffle=True)`` creates a fresh random permutation when its
+    iterator is created.  That is convenient for ordinary training, but it
+    makes it impossible to reconstruct the remainder of a partially consumed
+    pass after a restart.  This sampler derives the permutation from
+    ``seed + epoch`` instead, so a checkpoint only needs to store the epoch
+    and batch cursor.
+    """
+
+    def __init__(self, data_source: Dataset, seed: int, shuffle: bool = True):
+        self.data_source = data_source
+        self.seed = int(seed)
+        self.shuffle = bool(shuffle)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        if not self.shuffle:
+            yield from range(len(self.data_source))
+            return
+
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        yield from torch.randperm(len(self.data_source), generator=generator).tolist()
+
+    def __len__(self) -> int:
+        return len(self.data_source)
+
+
+def _create_dataloaders_from_datasets(
+    train_ds: Dataset, val_ds: Dataset, cfg
+) -> tuple[DataLoader, DataLoader]:
+    """Create loaders for either in-memory or memory-mapped datasets."""
     # --- DataLoaders ---
     bs = int(cfg.batch_size)
     nw = int(getattr(cfg, "num_workers", 0))
+    seed = int(getattr(cfg, "seed", 42))
+    train_sampler = EpochRandomSampler(
+        train_ds,
+        seed=seed,
+        shuffle=bool(getattr(cfg, "shuffle", True)),
+    )
+    train_generator = torch.Generator().manual_seed(seed)
+    val_generator = torch.Generator().manual_seed(seed + 1)
 
     train_loader = DataLoader(
         train_ds,
         batch_size=bs,
-        shuffle=bool(getattr(cfg, "shuffle", True)),
+        sampler=train_sampler,
+        generator=train_generator,
         drop_last=bool(getattr(cfg, "drop_last", True)),
         num_workers=nw,
         pin_memory=bool(getattr(cfg, "pin_memory", True)),
@@ -192,6 +270,7 @@ def create_dataloaders(cfg) -> tuple[DataLoader, DataLoader]:
         val_ds,
         batch_size=bs,
         shuffle=False,
+        generator=val_generator,
         drop_last=False,
         num_workers=nw,
         pin_memory=bool(getattr(cfg, "pin_memory", True)),

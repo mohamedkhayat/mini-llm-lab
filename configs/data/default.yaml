@@ -3,6 +3,7 @@ source: files
 files:
   - "data/the_verdict"
 max_files: null
+tokenized_dir: null
 hf_dataset: null
 hf_config: null
 text_column: text

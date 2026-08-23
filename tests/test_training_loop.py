@@ -329,14 +329,6 @@ def test_stop_flag_between_steps_writes_latest_and_logs_the_interrupt(tmp_path):
     assert trainer.logger.finished is True
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "The KeyboardInterrupt path does not log the interrupted-run metric "
-        "yet; ticket 06 unifies both stop paths on one handler, which this "
-        "assertion turns green (the marker is removed then)."
-    ),
-)
 def test_keyboard_interrupt_from_the_data_iterator_takes_the_graceful_path(tmp_path):
     """A KeyboardInterrupt raised by the data iterator takes the same
     graceful path as a signal stop: latest checkpoint written, the

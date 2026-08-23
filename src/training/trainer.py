@@ -82,30 +82,69 @@ def get_model_parameter_metrics(model):
 
 
 class Trainer:
+    """Run assembly (the constructor) and the training loop (:meth:`train`)."""
+
     def __init__(self, cfg):
+        """Assemble a run in seven named setup steps, in dependency order."""
         self.cfg = cfg
-        self.resume_path = resolve_resume_path(cfg.training)
+        self._setup_runtime()
+        self._build_model()
+        self._setup_data()
+        self._resolve_budget()
+        self._apply_resume()
+        self._build_scheduler()
+        self._setup_logging()
+
+    def _setup_runtime(self):
+        """Resume checkpoint load, seed, device, CUDA precision / Tensor
+        Core / compile configuration, the save directory, and run identity."""
+        self.resume_path = resolve_resume_path(self.cfg.training)
         self.resume_checkpoint = None
         if self.resume_path is not None:
             self.resume_checkpoint = load_checkpoint(self.resume_path)
             print(f"Resuming from checkpoint: {self.resume_path}")
 
-        self.set_seed(cfg.training.seed)
+        self.set_seed(self.cfg.training.seed)
 
         self.device = torch.device(
-            cfg.training.device if torch.cuda.is_available() else "cpu"
+            self.cfg.training.device if torch.cuda.is_available() else "cpu"
         )
 
-        self.use_bf16 = bool(getattr(cfg.training, "use_bf16", False))
-        self.use_tensor_cores = bool(getattr(cfg.training, "use_tensor_cores", False))
-        self.use_compile = bool(getattr(cfg.training, "compile", False))
-        self.compile_mode = str(getattr(cfg.training, "compile_mode", "default"))
+        self.use_bf16 = bool(getattr(self.cfg.training, "use_bf16", False))
+        self.use_tensor_cores = bool(getattr(self.cfg.training, "use_tensor_cores", False))
+        self.use_compile = bool(getattr(self.cfg.training, "compile", False))
+        self.compile_mode = str(getattr(self.cfg.training, "compile_mode", "default"))
         self._configure_cuda_features()
 
+        # --- Checkpoint dir (hydra run dir, falls back to ./runs) ---
+        if self.resume_path is not None:
+            # Keep subsequent latest/best/final checkpoints beside the source
+            # checkpoint, so restarting a job does not split one experiment
+            # across a new Hydra directory.
+            self.save_dir = str(self.resume_path.parent)
+        else:
+            try:
+                from hydra.core.hydra_config import HydraConfig
+
+                self.save_dir = HydraConfig.get().runtime.output_dir
+            except Exception:
+                self.save_dir = "runs"
+        os.makedirs(self.save_dir, exist_ok=True)
+
+        # Run-manifest identity fields, computed once per run.
+        self.run_name = self.cfg.training.exp_name
+        self._manifest_git_commit = git_commit()
+        self._manifest_config_digest = config_digest(
+            OmegaConf.to_container(self.cfg, resolve=True)
+        )
+
+    def _build_model(self):
+        """Checkpoint model-config override, model build, state restore,
+        device move, compile, parameter metrics + summary print."""
         # Reconstruct the architecture from the checkpoint when possible. In
         # particular, this preserves old checkpoints whose model config did
         # not contain ``tie_embeddings`` (missing means untied).
-        self.model_cfg = cfg.model
+        self.model_cfg = self.cfg.model
         if self.resume_checkpoint is not None:
             saved_model_cfg = self.resume_checkpoint.get("model_cfg")
             if saved_model_cfg is None:
@@ -136,20 +175,28 @@ class Trainer:
         self.model_parameter_metrics = get_model_parameter_metrics(self.model)
         self._print_model_summary()
 
-        optimizer_kwargs = {
-            "lr": float(cfg.training.lr),
-            "weight_decay": float(cfg.training.weight_decay),
-        }
+    def _setup_data(self):
+        """Tokenizer, dataloaders, per-step / per-epoch token counts,
+        optimizer, and loss."""
+        self.tokenizer = get_tokenizer(self.cfg.data.tokenizer_name)
+        self.train_loader, self.val_loader = create_dataloaders(self.cfg.data)
 
+        self.steps_per_epoch = len(self.train_loader)
+        self.tokens_per_step = int(self.cfg.data.batch_size) * int(self.cfg.data.seq_len)
+
+        optimizer_kwargs = {
+            "lr": float(self.cfg.training.lr),
+            "weight_decay": float(self.cfg.training.weight_decay),
+        }
         if self.device.type == "cuda":
             optimizer_kwargs["fused"] = True
         self.optimizer = torch.optim.AdamW(self.model.parameters(), **optimizer_kwargs)
 
         self.criterion = torch.nn.CrossEntropyLoss()
-        self.tokenizer = get_tokenizer(cfg.data.tokenizer_name)
-        self.train_loader, self.val_loader = create_dataloaders(cfg.data)
 
-        self.log_backend = resolve_log_backend(cfg.training)
+    def _resolve_budget(self):
+        """Counter initialization, total-step resolution, the pre-restore WSD
+        decision, the resume-consistency check, and the budget prints."""
         self.step = 0
         self.best_val_loss = float("inf")
         self.epoch = 0
@@ -158,10 +205,9 @@ class Trainer:
         self.run_elapsed_seconds = 0.0
         self.stop_requested = False
         self.wandb_run_id = None
-        self.steps_per_epoch = len(self.train_loader)
-        self.tokens_per_step = int(cfg.data.batch_size) * int(cfg.data.seq_len)
+
         self.total_steps, self.budget_name = resolve_total_steps(
-            cfg.training, self.steps_per_epoch, self.tokens_per_step
+            self.cfg.training, self.steps_per_epoch, self.tokens_per_step
         )
         self.total_train_tokens = self.total_steps * self.tokens_per_step
 
@@ -173,7 +219,7 @@ class Trainer:
             if self.resume_checkpoint is not None
             else None
         )
-        self.start_decay_requested = bool(getattr(cfg.training, "start_decay", False))
+        self.start_decay_requested = bool(getattr(self.cfg.training, "start_decay", False))
         # Decidable before the step counter is restored: only whether a
         # decay triggers matters here (the true trigger step is filled in
         # after the restore), so resume_step=0 is a placeholder.
@@ -198,30 +244,10 @@ class Trainer:
                 f"({self.steps_per_epoch:,}/data pass; budget={self.budget_name})"
             )
             print(f"Training tokens: {format_count(self.total_train_tokens)}")
-        print(f"Logging backend: {self.log_backend}")
 
-        # --- Checkpoint dir (hydra run dir, falls back to ./runs) ---
-        if self.resume_path is not None:
-            # Keep subsequent latest/best/final checkpoints beside the source
-            # checkpoint, so restarting a job does not split one experiment
-            # across a new Hydra directory.
-            self.save_dir = str(self.resume_path.parent)
-        else:
-            try:
-                from hydra.core.hydra_config import HydraConfig
-
-                self.save_dir = HydraConfig.get().runtime.output_dir
-            except Exception:
-                self.save_dir = "runs"
-        os.makedirs(self.save_dir, exist_ok=True)
-
-        # Run-manifest identity fields, computed once per run.
-        self.run_name = cfg.training.exp_name
-        self._manifest_git_commit = git_commit()
-        self._manifest_config_digest = config_digest(
-            OmegaConf.to_container(cfg, resolve=True)
-        )
-
+    def _apply_resume(self):
+        """Counter / cursor / RNG / W&B-id restore, the WSD state seed, the
+        stage label, and the decay-budget override with its prints."""
         if self.resume_checkpoint is not None:
             self._restore_training_state(self.resume_checkpoint)
 
@@ -230,6 +256,11 @@ class Trainer:
         # in the checkpoint wins over a fresh start_decay flag (a crash
         # mid-decay resumes from the original trigger step). Fresh runs never
         # trigger a decay.
+        saved_wsd = (
+            self.resume_checkpoint.get("wsd")
+            if self.resume_checkpoint is not None
+            else None
+        )
         if self.resume_checkpoint is not None:
             self.wsd_decay = resolve_wsd_state(
                 saved_wsd, self.start_decay_requested, self.step
@@ -242,14 +273,11 @@ class Trainer:
             decay_triggered=decay_triggered,
         )
 
-        peak_lr = float(cfg.training.lr)
-        min_lr = float(getattr(cfg.training, "min_lr", peak_lr * 0.1))
-        decay_fraction = float(cfg.training.lr_decay_fraction)
         if decay_triggered:
-            # Decay runs skip warmup (stage 1 already ran it) and derive
-            # their budget from the trigger step: D = round(S*f/(1-f)). The
-            # run stops exactly when the decay finishes.
-            warmup = 0
+            # Decay runs re-derive their budget from the trigger step
+            # (rule of three): D = round(S*f/(1-f)). The run stops exactly
+            # when the decay finishes.
+            decay_fraction = float(self.cfg.training.lr_decay_fraction)
             self.total_steps, decay_steps = resolve_decay_budget(
                 self.wsd_decay["step"], decay_fraction
             )
@@ -265,14 +293,28 @@ class Trainer:
                 f"({self.steps_per_epoch:,}/data pass; budget={self.budget_name})"
             )
             print(f"Training tokens: {format_count(self.total_train_tokens)}")
+
+    def _build_scheduler(self):
+        """Warmup / decay math and the LR lambda, then the scheduler — and
+        the load-bearing restore order: the scheduler state is restored
+        before the optimizer state, so the checkpoint's exact current
+        learning rate wins (LambdaLR construction reinitializes the
+        optimizer's current LR)."""
+        peak_lr = float(self.cfg.training.lr)
+        min_lr = float(getattr(self.cfg.training, "min_lr", peak_lr * 0.1))
+        decay_fraction = float(self.cfg.training.lr_decay_fraction)
+        if self.wsd_decay["triggered"]:
+            # Decay runs skip warmup (stage 1 already ran it); the decay
+            # budget was derived from the trigger step in _apply_resume.
+            warmup = 0
+            decay_steps = resolve_decay_budget(
+                self.wsd_decay["step"], decay_fraction
+            )[1]
         else:
-            warmup = int(cfg.training.warmup_fraction * self.total_steps)
+            warmup = int(self.cfg.training.warmup_fraction * self.total_steps)
             decay_steps = int(decay_fraction * self.total_steps)
 
-        lr_lambda = build_lr_lambda(
-            warmup, decay_steps, peak_lr, min_lr, self.wsd_decay
-        )
-
+        lr_lambda = build_lr_lambda(warmup, decay_steps, peak_lr, min_lr, self.wsd_decay)
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer, lr_lambda=lr_lambda
         )
@@ -292,7 +334,14 @@ class Trainer:
                 # the checkpoint's exact current LR wins.
                 self.optimizer.load_state_dict(optimizer_state)
 
-        # --- Log backend: one adapter per backend, resolved above ---
+    def _setup_logging(self):
+        """Backend resolution, the adapter init, and the initial
+        parameter-metric log."""
+        self.log_backend = resolve_log_backend(self.cfg.training)
+        print(f"Logging backend: {self.log_backend}")
+
+        # One adapter per backend; the trainer holds exactly one and contains
+        # no W&B branches of its own.
         self.logger = create_logger(self.log_backend)
         stage_marker = {"training_stage": self.stage_label}
         if self.wsd_decay["triggered"]:
@@ -302,7 +351,7 @@ class Trainer:
         )
         self.logger.init(
             name=self.run_name,
-            config=OmegaConf.to_container(cfg, resolve=True),
+            config=OmegaConf.to_container(self.cfg, resolve=True),
             saved_config=saved_cfg if isinstance(saved_cfg, dict) else None,
             computed={
                 "computed_steps_per_epoch": self.steps_per_epoch,
@@ -652,6 +701,119 @@ class Trainer:
         self._update_run_elapsed()
         self.save_checkpoint(os.path.join(self.save_dir, "latest.pt"), kind="latest")
 
+    def _log_progress(self, loss, current_epoch):
+        """Timer math (CUDA events on GPU, wall clock on CPU), the progress
+        metrics, and the console line for one logged step."""
+        if self._use_cuda_timer:
+            self._timer_end.record()
+            torch.cuda.synchronize(self.device)
+            elapsed = self._timer_start.elapsed_time(self._timer_end) / 1000
+            self._timer_start.record()
+        else:
+            elapsed = time.time() - self._timer_start_time
+            self._timer_start_time = time.time()
+
+        tokens_since_log = self.tokens_seen - self._log_start_tokens
+        tok_per_sec = tokens_since_log / max(elapsed, 1e-9)
+        self._update_run_elapsed()
+        progress = min(self.step / max(self.total_steps, 1), 1.0)
+        steps_remaining = max(self.total_steps - self.step, 0)
+        steps_per_second = self.step / max(self.run_elapsed_seconds, 1e-9)
+        estimated_remaining_seconds = steps_remaining / max(steps_per_second, 1e-9)
+        memory_metrics = self._memory_metrics()
+        self._log_metrics(
+            {
+                "train/loss": loss,
+                "train/ppl": math.exp(loss),
+                "train/lr": self.get_lr(),
+                "train/tokens_seen": self.tokens_seen,
+                "train/tok_per_sec": tok_per_sec,
+                "train/interval_seconds": elapsed,
+                "run/elapsed_seconds": self.run_elapsed_seconds,
+                "run/elapsed_minutes": self.run_elapsed_seconds / 60,
+                "run/elapsed_hours": self.run_elapsed_seconds / 3600,
+                "run/steps_per_epoch": self.steps_per_epoch,
+                "run/total_steps": self.total_steps,
+                "run/steps_remaining": steps_remaining,
+                "run/progress": progress,
+                "run/estimated_remaining_seconds": estimated_remaining_seconds,
+                "step": self.step,
+                **memory_metrics,
+            }
+        )
+        print(
+            f"data pass {current_epoch + 1} | step {self.step} | "
+            f"tokens {format_count(self.tokens_seen)} | loss {loss:.4f} | "
+            f"lr {self.get_lr():.2e} | tok/s {tok_per_sec:,.0f}"
+        )
+        self._log_start_tokens = self.tokens_seen
+
+    def _run_evaluation(self):
+        """Evaluation losses + generated sample + best-checkpoint save."""
+        train_loss, train_ppl, val_loss, val_ppl = self.evaluate()
+        # Train loss here is over the first N batches in eval mode, making it
+        # comparable to validation loss.
+        self._log_metrics(
+            {
+                "val/loss": val_loss,
+                "val/ppl": val_ppl,
+                "train/loss_full": train_loss,
+                "train/ppl_full": train_ppl,
+                "step": self.step,
+            }
+        )
+        if self.log_backend != "wandb":
+            print(
+                f"eval | step {self.step} | train loss {train_loss:.4f} | "
+                f"val loss {val_loss:.4f}"
+            )
+        self.generate_and_log_sample(loss=val_loss)
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+            self._update_run_elapsed()
+            best_path = os.path.join(self.save_dir, "best.pt")
+            self.save_checkpoint(best_path, kind="best")
+            self._log_checkpoint_artifact("best", "best-checkpoint", best_path)
+
+    def _save_periodic_checkpoint(self):
+        """Periodic restart checkpoint: a step-N file plus a latest refresh."""
+        self._update_run_elapsed()
+        self.save_checkpoint(
+            os.path.join(self.save_dir, f"step_{self.step}.pt"), kind="periodic"
+        )
+        self.save_checkpoint(os.path.join(self.save_dir, "latest.pt"), kind="latest")
+
+    def _handle_stop(self):
+        """One unified stop path for signal stops and KeyboardInterrupt:
+        checkpoint the current step, then log the interrupted-run metrics."""
+        print(f"Saving restart checkpoint at step {self.step}...")
+        self._save_latest_checkpoint()
+        self._log_metrics(
+            {"run/interrupted": 1, "run/steps_remaining": self.total_steps - self.step}
+        )
+
+    def _finish_run(self):
+        """Run completion: closing run metrics, latest + final checkpoints,
+        and the final checkpoint's artifact."""
+        self._update_run_elapsed()
+        self._log_metrics(
+            {
+                "run/elapsed_seconds": self.run_elapsed_seconds,
+                "run/elapsed_minutes": self.run_elapsed_seconds / 60,
+                "run/elapsed_hours": self.run_elapsed_seconds / 3600,
+                "run/steps_per_epoch": self.steps_per_epoch,
+                "run/total_steps": self.total_steps,
+                "run/steps_remaining": 0,
+                "run/progress": 1.0,
+                "run/estimated_remaining_seconds": 0.0,
+                "step": self.step,
+            }
+        )
+        self._save_latest_checkpoint()
+        final_path = os.path.join(self.save_dir, "final_model.pt")
+        self.save_checkpoint(final_path, kind="final")
+        self._log_checkpoint_artifact("final", "final-model", final_path)
+
     def train(self):
         """Outer training loop."""
         self.model.train()
@@ -660,16 +822,16 @@ class Trainer:
         previous_handlers = self._install_shutdown_handlers()
 
         # Match the reference implementation: CUDA events measure GPU work,
-        # while wall-clock timing is used for CPU fallback.
-        use_cuda_timer = self.device.type == "cuda"
-        if use_cuda_timer:
-            timer_start = torch.cuda.Event(enable_timing=True)
-            timer_end = torch.cuda.Event(enable_timing=True)
+        # while wall-clock timing is used for the CPU fallback.
+        self._use_cuda_timer = self.device.type == "cuda"
+        if self._use_cuda_timer:
+            self._timer_start = torch.cuda.Event(enable_timing=True)
+            self._timer_end = torch.cuda.Event(enable_timing=True)
             torch.cuda.synchronize(self.device)
-            timer_start.record()
+            self._timer_start.record()
         else:
-            timer_start_time = time.time()
-        log_start_tokens = self.tokens_seen
+            self._timer_start_time = time.time()
+        self._log_start_tokens = self.tokens_seen
 
         try:
             while self.step < self.total_steps and not self.stop_requested:
@@ -682,9 +844,7 @@ class Trainer:
                         break
 
                     x, y = x.to(self.device), y.to(self.device)
-                    loss = self.train_step(
-                        x, y
-                    )  # train loss for this batch with dropout and stuff
+                    loss = self.train_step(x, y)
                     self.step += 1
                     self.tokens_seen += x.numel()
 
@@ -697,134 +857,32 @@ class Trainer:
                         self.batch_in_epoch = batch_idx + 1
 
                     if self.step % self.cfg.training.log_interval == 0:
-                        if use_cuda_timer:
-                            timer_end.record()
-                            torch.cuda.synchronize(self.device)
-                            elapsed = timer_start.elapsed_time(timer_end) / 1000
-                            timer_start.record()
-                        else:
-                            elapsed = time.time() - timer_start_time
-                            timer_start_time = time.time()
-
-                        tokens_since_log = self.tokens_seen - log_start_tokens
-                        tok_per_sec = tokens_since_log / max(elapsed, 1e-9)
-                        self._update_run_elapsed()
-                        progress = min(self.step / max(self.total_steps, 1), 1.0)
-                        steps_remaining = max(self.total_steps - self.step, 0)
-                        steps_per_second = self.step / max(
-                            self.run_elapsed_seconds, 1e-9
-                        )
-                        estimated_remaining_seconds = steps_remaining / max(
-                            steps_per_second, 1e-9
-                        )
-                        memory_metrics = self._memory_metrics()
-                        self._log_metrics(
-                            {
-                                "train/loss": loss,
-                                "train/ppl": math.exp(loss),
-                                "train/lr": self.get_lr(),
-                                "train/tokens_seen": self.tokens_seen,
-                                "train/tok_per_sec": tok_per_sec,
-                                "train/interval_seconds": elapsed,
-                                "run/elapsed_seconds": self.run_elapsed_seconds,
-                                "run/elapsed_minutes": self.run_elapsed_seconds / 60,
-                                "run/elapsed_hours": self.run_elapsed_seconds / 3600,
-                                "run/steps_per_epoch": self.steps_per_epoch,
-                                "run/total_steps": self.total_steps,
-                                "run/steps_remaining": steps_remaining,
-                                "run/progress": progress,
-                                "run/estimated_remaining_seconds": estimated_remaining_seconds,
-                                "step": self.step,
-                                **memory_metrics,
-                            }
-                        )
-                        print(
-                            f"data pass {current_epoch + 1} | step {self.step} | "
-                            f"tokens {format_count(self.tokens_seen)} | loss {loss:.4f} | "
-                            f"lr {self.get_lr():.2e} | tok/s {tok_per_sec:,.0f}"
-                        )
-                        log_start_tokens = self.tokens_seen
+                        self._log_progress(loss, current_epoch)
                     if self.step % self.cfg.training.eval_interval == 0:
-                        train_loss, train_ppl, val_loss, val_ppl = self.evaluate()
-                        # Train loss here is over the first N batches in eval
-                        # mode, making it comparable to validation loss.
-                        self._log_metrics(
-                            {
-                                "val/loss": val_loss,
-                                "val/ppl": val_ppl,
-                                "train/loss_full": train_loss,
-                                "train/ppl_full": train_ppl,
-                                "step": self.step,
-                            }
-                        )
-                        if self.log_backend != "wandb":
-                            print(
-                                f"eval | step {self.step} | train loss {train_loss:.4f} | "
-                                f"val loss {val_loss:.4f}"
-                            )
-                        self.generate_and_log_sample(loss=val_loss)
-                        if val_loss < self.best_val_loss:
-                            self.best_val_loss = val_loss
-                            self._update_run_elapsed()
-                            best_path = os.path.join(self.save_dir, "best.pt")
-                            self.save_checkpoint(best_path, kind="best")
-                            self._log_checkpoint_artifact("best", "best-checkpoint", best_path)
+                        self._run_evaluation()
                     if (
                         self.cfg.training.save_interval
                         and self.step % self.cfg.training.save_interval == 0
                     ):
-                        self._update_run_elapsed()
-                        self.save_checkpoint(
-                            os.path.join(self.save_dir, f"step_{self.step}.pt"),
-                            kind="periodic",
-                        )
-                        self.save_checkpoint(
-                            os.path.join(self.save_dir, "latest.pt"), kind="latest"
-                        )
-
+                        self._save_periodic_checkpoint()
                     if self.stop_requested:
-                        print(f"Saving restart checkpoint at step {self.step}...")
-                        self._save_latest_checkpoint()
-                        self._log_metrics(
-                            {"run/interrupted": 1, "run/steps_remaining": self.total_steps - self.step}
-                        )
-                        return
-
+                        break
                 # A signal can arrive while the DataLoader is preparing the
                 # next batch, before the inner loop reaches the post-step
                 # check above.
                 if self.stop_requested:
-                    print(f"Saving restart checkpoint at step {self.step}...")
-                    self._save_latest_checkpoint()
-                    self._log_metrics(
-                        {"run/interrupted": 1, "run/steps_remaining": self.total_steps - self.step}
-                    )
-                    return
+                    break
 
-            self._update_run_elapsed()
-            self._log_metrics(
-                {
-                    "run/elapsed_seconds": self.run_elapsed_seconds,
-                    "run/elapsed_minutes": self.run_elapsed_seconds / 60,
-                    "run/elapsed_hours": self.run_elapsed_seconds / 3600,
-                    "run/steps_per_epoch": self.steps_per_epoch,
-                    "run/total_steps": self.total_steps,
-                    "run/steps_remaining": 0,
-                    "run/progress": 1.0,
-                    "run/estimated_remaining_seconds": 0.0,
-                    "step": self.step,
-                }
-            )
-            self._save_latest_checkpoint()
-            final_path = os.path.join(self.save_dir, "final_model.pt")
-            self.save_checkpoint(final_path, kind="final")
-            self._log_checkpoint_artifact("final", "final-model", final_path)
+            if self.stop_requested:
+                self._handle_stop()
+            else:
+                self._finish_run()
         except KeyboardInterrupt:
             # Covers an external KeyboardInterrupt that bypasses our signal
-            # handler, while still preserving the last completed optimizer step.
+            # handler, while still preserving the last completed optimizer
+            # step; the unified stop path logs the interrupted-run metric.
             self.stop_requested = True
-            print(f"Interrupted; saving restart checkpoint at step {self.step}...")
-            self._save_latest_checkpoint()
+            self._handle_stop()
         finally:
             self._restore_shutdown_handlers(previous_handlers)
             self.close()

@@ -4,16 +4,40 @@ compile: false
 compile_mode: default
 use_bf16: false
 use_tensor_cores: false
+# Select ``wandb`` or ``terminal``. WANDB_MODE=disabled also selects terminal.
+log_backend: wandb
+# ``max_steps`` or ``max_tokens`` overrides the epoch fallback. If both are
+# set, the trainer raises an error to avoid an ambiguous training budget.
+max_steps: null
+max_tokens: null
 epochs: 10
 lr: 5e-4
 weight_decay: 0.1
-warmup_steps: 500
-min_lr: 0.0
+# Fraction of the stage-1 budget used for the linear learning-rate warmup.
+# Decay runs (start_decay) skip warmup entirely — it already happened in
+# stage 1. Must be >= 0.
+warmup_fraction: 0.1
+# Learning-rate floor reached at the end of the WSD decay. Must be positive
+# and no greater than `lr`.
+min_lr: 1e-5
+# Fraction of the FINAL run occupied by the decay (must be in (0, 1)). In a
+# two-stage run that starts decaying at resume step S, the decay lasts
+# D = round(S*f/(1-f)) steps and the run stops exactly when it ends.
+lr_decay_fraction: 0.2
 max_grad_norm: 1.0
 eval_interval: 200
 eval_batches: 50
 log_interval: 10
+# Write restart-complete checkpoints at this many optimizer steps. ``latest.pt``
+# is updated atomically; Ctrl-C/SIGTERM also writes it immediately after the
+# current optimizer step. Leave null to disable periodic saves.
 save_interval: null
+# Explicit checkpoint path, or ``latest``/``auto`` for the newest latest.pt.
+resume_from: null
 seed: 42
-start_context: Santa claus is
+start_context: Every effort moves you
 max_new_tokens: 50
+# Stage-2 flag: on resume, start (or continue) the WSD decay from the resume
+# step instead of keeping the stable plateau. Ignored on fresh runs; a
+# triggered state saved in a checkpoint wins over this flag on resume.
+start_decay: false

@@ -104,10 +104,11 @@ python train.py training.max_tokens=100000000
 python train.py training.max_steps=10000
 ```
 
-The default learning-rate schedule warms up for `training.warmup_steps`, then
-cosine-decays to `training.min_lr` by 90% of the selected budget and holds that
-floor for the final 10%. Set `training.lr_decay_end_fraction` to change the
-endpoint. `training.max_steps` and `training.max_tokens` are mutually
+The default learning-rate schedule is WSD (see **Two-stage WSD training**
+below): a linear warmup over `training.warmup_fraction` of the budget, a flat
+plateau at `training.lr`, and a final cosine decay to `training.min_lr`
+whose length is `training.lr_decay_fraction` of the whole run.
+`training.max_steps` and `training.max_tokens` are mutually
 exclusive.
 
 ### `train.py` command reference
@@ -191,22 +192,25 @@ the full corpus.
 | `training.epochs` | `10` | Backwards-compatible fallback when neither `max_steps` nor `max_tokens` is set. One epoch means one complete pass through the training dataloader. |
 | `training.lr` | `5e-4` | AdamW peak learning rate. |
 | `training.weight_decay` | `0.1` | AdamW weight decay. |
-| `training.warmup_steps` | `500` | Number of initial optimizer steps in the linear learning-rate warmup. Must be non-negative and less than the total step budget. |
-| `training.min_lr` | `5e-5` | Learning-rate floor after cosine decay. It must be positive and no greater than `training.lr`. |
-| `training.lr_decay_end_fraction` | `0.9` | Fraction of the total budget at which cosine decay reaches `min_lr`; the floor is held for the remainder. Must be in `(0, 1]`. |
+| `training.warmup_fraction` | `0.1` | Fraction of the stage-1 budget used for the linear learning-rate warmup. Decay runs (stage 2, `start_decay=true`) skip warmup because it already happened in stage 1. |
+| `training.min_lr` | `1e-5` | Learning-rate floor reached at the end of the WSD decay. It must be positive and no greater than `training.lr`. |
+| `training.lr_decay_fraction` | `0.2` | Fraction of the final run occupied by the decay, in `(0, 1)`. In a two-stage run that starts decaying at resume step `S`, the decay lasts `D = round(S · f / (1 − f))` steps and the run stops exactly when the decay ends. |
 | `training.max_grad_norm` | `1.0` | Maximum gradient norm for global gradient clipping. |
 | `training.eval_interval` | `200` | Run evaluation and generate a sample every this many optimizer steps. The best validation checkpoint is updated when validation loss improves. |
 | `training.eval_batches` | `50` | Maximum number of training and validation batches used for each evaluation. Set it lower for quick experiments; evaluation uses model-eval mode. |
 | `training.log_interval` | `10` | Print and log training loss, learning rate, throughput, and progress every this many optimizer steps. |
 | `training.save_interval` | `null` | Optional periodic restart interval in optimizer steps. It writes both `step_<N>.pt` and an updated `latest.pt`. |
 | `training.resume_from` | `null` | Checkpoint path to resume, relative to the launch directory, or `latest`/`auto` to select the newest `latest.pt` below the project. |
+| `training.start_decay` | `false` | Stage-2 flag: on resume, start (or continue) the WSD decay from the resume step instead of keeping the stable plateau. Ignored on fresh runs. |
 | `training.seed` | `42` | Global Python, NumPy, PyTorch, and CUDA seed. It is also stored in checkpoints for reproducible continuation. |
 | `training.start_context` | `Every effort moves you` | Prompt used when generating the periodic text sample. |
 | `training.max_new_tokens` | `50` | Maximum number of tokens appended to `start_context` for each sample. |
 
-The schedule is linear warmup followed by cosine decay from `lr` to `min_lr`.
-The selected budget determines the schedule length, so changing a budget also
-changes the step at which the learning rate reaches its floor.
+The learning-rate schedule is WSD (warmup → stable → decay): a linear warmup,
+a flat plateau at `lr`, and a final cosine decay to `min_lr` that is
+triggered by a stage-2 run (see **Two-stage WSD training** below). A single
+run that never triggers the decay trains warmup plus the stable plateau for
+the whole chosen budget.
 
 #### Model parameters (`model.*`)
 
@@ -374,9 +378,9 @@ can write `best.pt` there; periodic checkpoints are enabled with
 
 Checkpoints written by the current trainer contain the model, optimizer,
 learning-rate scheduler, Python/NumPy/PyTorch/CUDA RNG states, deterministic
-data cursor, token counter, and W&B run ID. Checkpoint writes use a temporary
-file plus an atomic rename, so an interrupted write cannot leave a partially
-written `latest.pt`.
+data cursor, token counter, W&B run ID, and the WSD trigger state. Checkpoint
+writes use a temporary file plus an atomic rename, so an interrupted write
+cannot leave a partially written `latest.pt`.
 
 Enable periodic restart checkpoints and resume with:
 
@@ -389,14 +393,69 @@ You can also use `training.resume_from=latest` to select the newest
 `latest.pt` below the project directory. Pressing Ctrl-C, or receiving a
 graceful SIGTERM/SIGHUP, finishes the current optimizer step and writes
 `latest.pt`; the next command continues from the next batch and keeps the same
-W&B run. Keep the original data, model, batch size, sequence length, stride,
-and training budget for a bit-for-bit continuation. A hard power loss or
-`kill -9` can only resume from the most recent periodic checkpoint, so choose
-`save_interval` according to the amount of work you are willing to repeat.
+W&B run. Keep the original data, model, batch size, sequence length, and stride
+for a bit-for-bit continuation; the training budget must also match, **unless
+the resume is a decay run** (`start_decay=true`): the trainer then re-derives
+the total budget from the trigger step and accepts a different configured
+budget. A hard power loss or `kill -9` can only resume from the most recent
+periodic checkpoint, so choose `save_interval` according to the amount of work
+you are willing to repeat.
 
 Checkpoints from the older trainer can still load their model and optimizer,
 but they do not contain the scheduler, RNG, data cursor, or W&B ID and are
 therefore not exact-resume checkpoints.
+
+Each run directory also holds a `run_manifest.json` (written in terminal mode
+as well) mapping every checkpoint file to the W&B run id/URL with per-save
+step, tokens seen, stage, best val loss, and timestamp, plus the run name,
+git commit, and a config digest at the top level. Use it to go from a W&B run
+page to the local files (top-level `wandb_run_id` / `wandb_url`), and from a
+local checkpoint file back to its run page (the `wandb_run_id` / `wandb_url`
+of its manifest entry).
+
+### Two-stage WSD training (warmup → stable → decay)
+
+The schedule is WSD: a linear warmup (`warmup_fraction` of the stage-1
+budget), a flat plateau at `lr` (the stable phase), and a final cosine decay
+to `min_lr` whose length is derived from where you stop.
+
+**Stage 1** — train warmup + stable against a budget you choose. Stop early
+with Ctrl-C (the trainer writes `latest.pt` after the current optimizer step)
+or let it run out the budget:
+
+```bash
+python train.py training.max_steps=10000
+```
+
+**Stage 2** — resume from `latest.pt`: either keep the stable plateau
+(extending pretraining in any number of increments) or start the final decay:
+
+```bash
+python train.py training.resume_from=latest                # keep stable
+python train.py training.resume_from=latest start_decay=true   # decay, then stop
+```
+
+With `start_decay=true` and resume step `S`, the decay lasts
+`D = round(S · f / (1 − f))` steps, where `f = training.lr_decay_fraction`
+is the fraction of the whole run the decay occupies, and the run **stops
+exactly when the decay finishes** — no steps are wasted at the floor.
+Example: `S = 30` with `f = 0.2` → `D = 8`, total `38` steps.
+
+- Stage 2 continues stage 1's W&B run (the checkpoint carries the run id), so
+  both phases appear as one continuous loss curve. The run page records the
+  stage (`training_stage`: `stage-1-stable` / `stage-2-stable` /
+  `stage-2-decay`) and, for decay runs, the trigger step; the
+  W&B-computed budget values reflect the decay run's derived budget.
+- The terminal output of a decay run prints the derived budget
+  (`budget=wsd_decay`) and the current learning rate on every progress line,
+  so local output matches W&B.
+- A crash mid-decay resumes correctly: the trigger state is saved inside the
+  checkpoint, and a resumed decay continues from the original trigger step
+  instead of restarting the decay.
+- `best.pt` and `final_model.pt` are uploaded to the W&B run as artifacts
+  (metadata: kind, stage, step, tokens seen, best val loss, git commit,
+  local path, W&B run id). Artifact upload failures only warn — they never
+  abort training. Periodic `latest.pt` / `step_<N>.pt` saves are local-only.
 
 ## Data behavior
 
@@ -417,10 +476,14 @@ one complete training batch.
 ## Outputs
 
 - W&B metrics include training/validation loss, perplexity, learning rate,
-  throughput, generated text samples, and model parameter counts.
+  throughput, generated text samples, and model parameter counts. When W&B is
+  the backend, `best.pt` and `final_model.pt` are additionally uploaded to
+  the run page as artifacts.
 - Terminal logging includes model parameter counts, training/evaluation loss,
-  and generated sample text.
-- Hydra stores run metadata and checkpoints under `runs/`.
+  learning rate, and generated sample text.
+- Hydra stores run metadata and checkpoints under `runs/`. Each run directory
+  also holds `run_manifest.json`, mapping every checkpoint file to the W&B
+  run id/URL with per-save stats (see **Two-stage WSD training**).
 - `runs/`, `wandb/`, and `checkpoints/` are ignored by Git.
 
 ### Chat UI
@@ -446,7 +509,8 @@ pytest
 ```
 
 The test suite covers causal attention, model-config validation, token-shard
-datasets, checkpoint state, and the training schedule.
+datasets, checkpoint state, and the training schedule (including the WSD
+two-stage budget, resume consistency, the run manifest, and W&B artifacts).
 
 ## Roadmap
 

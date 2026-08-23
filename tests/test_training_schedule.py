@@ -3,12 +3,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from training.trainer import (
+from training.schedule import (
     build_lr_lambda,
     resolve_decay_budget,
-    resolve_log_backend,
     resolve_total_steps,
 )
+from training.trainer import resolve_log_backend
 
 
 def test_log_backend_can_be_selected_for_terminal_output():

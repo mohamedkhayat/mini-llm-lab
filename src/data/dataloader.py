@@ -2,7 +2,7 @@ import glob
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler
 from tqdm import tqdm
 
 from data.dataset import GPTDataset, get_train_val_split
@@ -37,18 +37,18 @@ def _load_text_from_files(
 
 
 def _load_text_from_hf_dataset(cfg) -> str:
-    """Load and concatenate text from a Hugging Face dataset."""
+    """Load a bounded, non-streaming HF dataset into memory."""
     from datasets import load_dataset
 
     name = cfg.hf_dataset
     config = cfg.hf_config if cfg.hf_config else None
     split = cfg.split
     text_column = cfg.text_column
-    streaming = cfg.streaming
-
-    if streaming:
-        ds = load_dataset(name, config, split=split, streaming=True)
-        return _stream_chunks_to_string(ds, text_column)
+    if bool(getattr(cfg, "streaming", False)):
+        raise ValueError(
+            "Streaming Hugging Face data must use the IterableDataset path; "
+            "do not call _load_text_from_hf_dataset with streaming=True."
+        )
 
     if config:
         ds = load_dataset(name, config, split=split)
@@ -57,21 +57,6 @@ def _load_text_from_hf_dataset(cfg) -> str:
 
     parts: list[str] = []
     for example in tqdm(ds, desc="Loading HF dataset"):
-        text = example[text_column]
-        if isinstance(text, list):
-            text = " ".join(text)
-        parts.append(text)
-    return "\n".join(parts)
-
-
-def _stream_chunks_to_string(ds, text_column: str) -> str:
-    """Iterate a streaming HF dataset and buffer text.
-
-    Returns concatenated string. For very large corpora consider
-    token-caching (TODO).
-    """
-    parts: list[str] = []
-    for example in tqdm(ds, desc="Streaming HF dataset"):
         text = example[text_column]
         if isinstance(text, list):
             text = " ".join(text)
@@ -102,13 +87,117 @@ def _ensure_sample_data(root: Path | None = None) -> str:
     return verdict_path.read_text(encoding="utf-8")
 
 
-def create_dataloaders(cfg) -> tuple[DataLoader, DataLoader]:
+def _create_tokenized_dataloaders(cache_dir: Path, cfg) -> tuple[DataLoader, DataLoader]:
+    from data.token_shards import TokenShardDataset, load_manifest
+
+    manifest = load_manifest(cache_dir)
+    print(
+        f"Using tokenized cache: {cache_dir} "
+        f"({manifest['total_tokens']:,} tokens, "
+        f"{len(manifest['shards']):,} shards)"
+    )
+    train_ds = TokenShardDataset(
+        cache_dir,
+        seq_len=int(cfg.seq_len),
+        stride=int(getattr(cfg, "stride", cfg.seq_len)),
+        split="train",
+        tokenizer_name=str(cfg.tokenizer_name),
+    )
+    val_ds = TokenShardDataset(
+        cache_dir,
+        seq_len=int(cfg.seq_len),
+        stride=int(getattr(cfg, "stride", cfg.seq_len)),
+        split="val",
+        tokenizer_name=str(cfg.tokenizer_name),
+    )
+    return _create_dataloaders_from_datasets(train_ds, val_ds, cfg)
+
+
+def _create_hf_streaming_dataloaders(cfg, training_cfg) -> tuple[DataLoader, DataLoader]:
+    from data.hf_streaming import HFStreamingWindowDataset
+
+    num_workers = int(getattr(cfg, "num_workers", 0))
+    batch_size = int(cfg.batch_size)
+    eval_batches = int(
+        getattr(
+            training_cfg,
+            "eval_batches",
+            getattr(training_cfg, "eval_interval", 50),
+        )
+        if training_cfg is not None
+        else 50
+    )
+    common = {
+        "dataset_name": str(cfg.hf_dataset),
+        "dataset_config": cfg.hf_config if cfg.hf_config else None,
+        "split": str(cfg.split),
+        "text_column": str(cfg.text_column),
+        "tokenizer_name": str(cfg.tokenizer_name),
+        "seq_len": int(cfg.seq_len),
+        "stride": int(getattr(cfg, "stride", cfg.seq_len)),
+        "val_ratio": float(getattr(cfg, "val_ratio", 0.1)),
+        "seed": int(getattr(cfg, "seed", 42)),
+        "shuffle": bool(getattr(cfg, "shuffle", True)),
+        "shuffle_buffer_size": int(getattr(cfg, "shuffle_buffer_size", 10_000)),
+        "max_examples": getattr(cfg, "max_examples", None),
+        "max_tokens": getattr(cfg, "max_tokens", None),
+    }
+    train_ds = HFStreamingWindowDataset(
+        **common,
+        split_name="train",
+        max_samples=batch_size,
+        persistent_state=True,
+    )
+    val_ds = HFStreamingWindowDataset(
+        **common,
+        split_name="val",
+        max_samples=max(1, eval_batches * batch_size),
+        persistent_state=False,
+    )
+    train_eval_ds = HFStreamingWindowDataset(
+        **common,
+        split_name="train",
+        max_samples=max(1, eval_batches * batch_size),
+        persistent_state=False,
+    )
+
+    loader_cls = DataLoader
+    if num_workers > 0:
+        try:
+            from torchdata.stateful_dataloader import StatefulDataLoader
+        except ImportError as exc:
+            raise ImportError(
+                "HF streaming with data.num_workers>0 requires torchdata's "
+                "StatefulDataLoader so worker-local HF stream state can be "
+                "checkpointed. Install the project dependencies or set "
+                "data.num_workers=0."
+            ) from exc
+        loader_cls = StatefulDataLoader
+
+    print(
+        f"Using streaming HF dataset: {cfg.hf_dataset} "
+        "(native IterableDataset state; no corpus buffering or project HF shards)"
+    )
+    train_loader, val_loader = _create_dataloaders_from_datasets(
+        train_ds, val_ds, cfg, loader_cls=loader_cls
+    )
+    train_eval_loader, _ = _create_dataloaders_from_datasets(
+        train_eval_ds, val_ds, cfg, loader_cls=loader_cls
+    )
+    train_loader.stream_stateful = True
+    train_loader.checkpoint_dataset = train_ds
+    train_loader.eval_loader = train_eval_loader
+    return train_loader, val_loader
+
+
+def create_dataloaders(cfg, training_cfg=None) -> tuple[DataLoader, DataLoader]:
     """Create train and validation DataLoaders from a Hydra ``cfg.data`` node.
 
     Supports two source types via ``cfg.source``:
 
     - ``"files"``: local text files (glob patterns)
-    - ``"hf_dataset"``: Hugging Face Hub dataset
+    - ``"hf_dataset"``: Hugging Face Hub dataset; ``streaming=true`` uses an
+      on-the-fly IterableDataset and never concatenates the corpus
 
     File patterns are resolved against the launch directory (Hydra's
     ``runtime.cwd``), not the run dir Hydra switches into, so relative
@@ -136,32 +225,24 @@ def create_dataloaders(cfg) -> tuple[DataLoader, DataLoader]:
 
     tokenized_dir = getattr(cfg, "tokenized_dir", None)
     if tokenized_dir:
-        from data.token_shards import TokenShardDataset, load_manifest
-
         cache_dir = Path(tokenized_dir)
         if not cache_dir.is_absolute():
             cache_dir = root / cache_dir
-        manifest = load_manifest(cache_dir)
-        print(
-            f"Using tokenized cache: {cache_dir} "
-            f"({manifest['total_tokens']:,} tokens, "
-            f"{len(manifest['shards']):,} shards)"
-        )
-        train_ds = TokenShardDataset(
-            cache_dir,
-            seq_len=int(cfg.seq_len),
-            stride=int(getattr(cfg, "stride", cfg.seq_len)),
-            split="train",
-            tokenizer_name=str(cfg.tokenizer_name),
-        )
-        val_ds = TokenShardDataset(
-            cache_dir,
-            seq_len=int(cfg.seq_len),
-            stride=int(getattr(cfg, "stride", cfg.seq_len)),
-            split="val",
-            tokenizer_name=str(cfg.tokenizer_name),
-        )
-        return _create_dataloaders_from_datasets(train_ds, val_ds, cfg)
+        return _create_tokenized_dataloaders(cache_dir, cfg)
+
+    if source == "hf_dataset" and bool(getattr(cfg, "streaming", False)):
+        data_max_tokens = getattr(cfg, "max_tokens", None)
+        if data_max_tokens is not None:
+            raise ValueError(
+                "data.max_tokens is no longer part of the HF streaming data "
+                "contract: it capped unique source tokens per data pass, which "
+                "mixed a source-token limit with the window-token training "
+                "budget. Migrate to the training budget: set "
+                "training.max_tokens (window tokens, rounded down to complete "
+                "optimizer steps of batch_size x seq_len) or "
+                "training.max_steps, and remove data.max_tokens."
+            )
+        return _create_hf_streaming_dataloaders(cfg, training_cfg)
 
     max_files = int(getattr(cfg, "max_files", None) or 0) or None
 
@@ -238,13 +319,37 @@ class EpochRandomSampler(Sampler[int]):
 
 
 def _create_dataloaders_from_datasets(
-    train_ds: Dataset, val_ds: Dataset, cfg
+    train_ds: Dataset, val_ds: Dataset, cfg, loader_cls=DataLoader
 ) -> tuple[DataLoader, DataLoader]:
     """Create loaders for either in-memory or memory-mapped datasets."""
     # --- DataLoaders ---
     bs = int(cfg.batch_size)
     nw = int(getattr(cfg, "num_workers", 0))
     seed = int(getattr(cfg, "seed", 42))
+
+    if isinstance(train_ds, IterableDataset):
+        train_loader = loader_cls(
+            train_ds,
+            batch_size=bs,
+            drop_last=bool(getattr(cfg, "drop_last", True)),
+            num_workers=nw,
+            pin_memory=bool(getattr(cfg, "pin_memory", True)),
+            persistent_workers=bool(getattr(cfg, "persistent_workers", True))
+            if nw > 0
+            else False,
+        )
+        val_loader = loader_cls(
+            val_ds,
+            batch_size=bs,
+            drop_last=False,
+            num_workers=nw,
+            pin_memory=bool(getattr(cfg, "pin_memory", True)),
+            persistent_workers=bool(getattr(cfg, "persistent_workers", True))
+            if nw > 0
+            else False,
+        )
+        return train_loader, val_loader
+
     train_sampler = EpochRandomSampler(
         train_ds,
         seed=seed,

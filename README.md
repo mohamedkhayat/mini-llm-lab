@@ -164,15 +164,16 @@ parameter is only present in another preset.
 | `data.hf_config` | `null` | Optional dataset configuration or subset, for example `wikitext-2-raw-v1`. |
 | `data.text_column` | `text` | Field read from each Hugging Face example. List-valued fields are joined with spaces. |
 | `data.split` | `train` | Hugging Face dataset split to load. This is the source split; the trainer still creates its own train/validation split from the resulting token stream. |
-| `data.streaming` | `false` | Ask `datasets` for a streaming split. The current loader still concatenates the streamed text in memory before tokenization, so this is not an end-to-end streaming trainer. |
+| `data.streaming` | `false` | Ask `datasets` for a native `IterableDataset`. Streaming packs consecutive source rows (each EOS-terminated) into a rolling token buffer and cuts windows from the packed stream, so short rows still contribute tokens. It never materializes the corpus or creates project-owned HF shards. |
 | `data.tokenizer_name` | `gpt2` | `tiktoken` encoding name. The model's `vocab_size` must be compatible with the selected tokenizer. |
 | `data.seq_len` | `256` | Number of input tokens in each training example. Each target is the same window shifted one token to the right. Must not exceed `model.context_length`. |
 | `data.stride` | `128` | Distance between the starts of consecutive windows. `seq_len` gives adjacent windows; smaller values increase overlap. Must be positive. |
 | `data.batch_size` | `2` | Number of windows per optimizer step. The effective tokens per step are `batch_size * seq_len`. |
-| `data.val_ratio` | `0.1` | Fraction of the token stream reserved for validation. The split is deterministic and positional: the first portion is training data and the final portion is validation data. |
-| `data.shuffle` | `true` | Shuffle training windows with a deterministic epoch-dependent sampler. Validation windows are never shuffled. |
+| `data.val_ratio` | `0.1` | Validation fraction. In the regular loader this is a positional token split; in HF streaming mode it deterministically assigns source rows to train/validation because the total token count is unknown without consuming the stream. Packing happens within each split, so validation windows never contain training tokens. |
+| `data.shuffle` | `true` | Shuffle training windows with the deterministic local sampler, or HF's native `IterableDataset.shuffle()` in streaming mode. Validation windows are never shuffled. |
+| `data.shuffle_buffer_size` | `10000` | Native HF streaming shuffle-buffer size. It is an in-memory example buffer, not a token shard; HF also owns source-shard ordering and epoch reseeding. |
 | `data.drop_last` | `true` | Drop an incomplete training batch. Set `false` to retain it, but the effective token count per step then varies for the final batch of a data pass. |
-| `data.num_workers` | `4` | PyTorch dataloader worker processes. Use `0` for the simplest CPU debugging and smoke-test behavior. |
+| `data.num_workers` | `4` (file loaders) / `0` (streaming) | PyTorch dataloader worker processes for the file/token-cache loaders. HF streaming is single-process and must run with `0`: forked workers import `datasets` inside the child process, which breaks wandb's import hooks. Rows are tokenized on the main thread. |
 | `data.pin_memory` | `true` | Pin host batches for faster CPU-to-CUDA transfers when training on a GPU. |
 | `data.persistent_workers` | `true` | Keep dataloader workers alive between passes. It is automatically disabled when `data.num_workers=0`. |
 | `data.seed` | `42` | Seed used for dataloader generators and deterministic training-window order. `training.seed` controls the model and global random streams. |
@@ -193,6 +194,7 @@ the full corpus.
 | `training.use_bf16` | `false` | Use CUDA BF16 autocast for forward/evaluation work. Requires a BF16-capable GPU; it is disabled on CPU and errors on unsupported CUDA hardware. |
 | `training.use_tensor_cores` | `false` | Enable TF32 matmuls for eligible CUDA devices (compute capability 8.0+). This trades some numerical precision for throughput. |
 | `training.log_backend` | `wandb` | `wandb` logs metrics and samples to Weights & Biases; `terminal` prints samples and evaluation summaries locally. `term` and `console` are aliases for `terminal`. |
+| `training.upload_artifacts` | `false` | Upload full checkpoint files to W&B as artifacts when `training.log_backend=wandb`. Local checkpoints are always written; enable this only when remote checkpoint copies are wanted. |
 | `training.max_steps` | `null` | Explicit optimizer-step budget. Takes precedence over `epochs`; it cannot be set together with `training.max_tokens`. |
 | `training.max_tokens` | `null` | Explicit token budget. It is converted to complete optimizer steps using `data.batch_size * data.seq_len`, rounded down, and cannot be set together with `training.max_steps`. |
 | `training.epochs` | `10` | Backwards-compatible fallback when neither `max_steps` nor `max_tokens` is set. One epoch means one complete pass through the training dataloader. |
@@ -207,6 +209,8 @@ the full corpus.
 | `training.log_interval` | `10` | Print and log training loss, learning rate, throughput, and progress every this many optimizer steps. |
 | `training.save_interval` | `null` | Optional periodic restart interval in optimizer steps. It writes both `step_<N>.pt` and an updated `latest.pt`. |
 | `training.resume_from` | `null` | Checkpoint path to resume, relative to the launch directory, or `latest`/`auto` to select the newest `latest.pt` below the project. |
+| `training.resume_mode` | `exact` | `exact` preserves the original total budget; `continue` adds `training.continue_tokens` to an untriggered stable checkpoint at constant LR. |
+| `training.continue_tokens` | `null` | Additional token budget for `resume_mode=continue`, rounded down to complete optimizer batches. Do not combine it with `max_steps`, `max_tokens`, or `start_decay`. |
 | `training.start_decay` | `false` | Stage-2 flag: on resume, start (or continue) the WSD decay from the resume step instead of keeping the stable plateau. Ignored on fresh runs. |
 | `training.seed` | `42` | Global Python, NumPy, PyTorch, and CUDA seed. It is also stored in checkpoints for reproducible continuation. |
 | `training.start_context` | `Every effort moves you` | Prompt used when generating the periodic text sample. |
@@ -303,7 +307,16 @@ by Git.
 The included preset loads WikiText-2:
 
 ```bash
-python train.py data=hf_dataset data.num_workers=0
+python train.py data=hf_dataset data.hf_config=wikitext-2-raw-v1
+```
+
+For a dataset too large to materialize locally, enable native streaming and
+use an explicit step/token budget. Streaming always runs in the main process
+(`data.num_workers` must be `0`):
+
+```bash
+python train.py data=hf_dataset data.streaming=true \
+  training.max_tokens=100000000
 ```
 
 Any compatible dataset can be selected with Hydra overrides. Its examples must
@@ -317,9 +330,18 @@ python train.py \
   data.text_column=text
 ```
 
-Dataset downloads require internet access. The current streaming option avoids
-the Hugging Face download materialization step, but still concatenates all text
-in memory before tokenization.
+Dataset downloads require internet access. With `data.streaming=true`, Hugging
+Face progressively reads the source while training. Consecutive rows are packed
+into a rolling token buffer (EOS-separated, the same idiom as the file token
+cache in `data.token_shards`), so short rows contribute windows instead of
+being dropped. The project keeps only the sub-window buffer remainder (fewer
+than `seq_len + stride` tokens) in memory and stores HF's native source state
+plus that buffer in checkpoints. The train stream uses one long-lived
+iterator per source pass, so HF's shuffle buffer is refilled only on pass
+boundaries and on checkpoint restore — at most `data.shuffle_buffer_size`
+rows are skipped there, never re-read. Exact source order after a shuffled
+resume is not guaranteed: HF refills its shuffle buffer rather than
+checkpointing the buffer contents.
 
 For the Project Gutenberg preset, cap the number of books while experimenting:
 
@@ -388,7 +410,9 @@ can write `best.pt` there; periodic checkpoints are enabled with
 
 Checkpoints written by the current trainer contain the model, optimizer,
 learning-rate scheduler, Python/NumPy/PyTorch/CUDA RNG states, deterministic
-data cursor, token counter, W&B run ID, and the WSD trigger state. Checkpoint
+data cursor, token counter, W&B run ID, and the WSD trigger state. HF streaming
+checkpoints additionally carry the native `IterableDataset`/stateful-loader
+state, including its source shard/example position. Checkpoint
 writes use a temporary file plus an atomic rename, so an interrupted write
 cannot leave a partially written `latest.pt`.
 
@@ -410,6 +434,17 @@ the total budget from the trigger step and accepts a different configured
 budget. A hard power loss or `kill -9` can only resume from the most recent
 periodic checkpoint, so choose `save_interval` according to the amount of work
 you are willing to repeat.
+
+To add stable plateau training after a finished or interrupted run, use an
+explicit additional token budget:
+
+```bash
+python train.py training.resume_from=latest \
+  training.resume_mode=continue training.continue_tokens=100000000
+```
+
+This mode is only for an untriggered stable checkpoint. It does not start a new
+warmup or decay; a later `start_decay=true` run uses the extended step timeline.
 
 Checkpoints from the older trainer can still load their model and optimizer,
 but they do not contain the scheduler, RNG, data cursor, or W&B ID and are
@@ -462,21 +497,25 @@ Example: `S = 30` with `f = 0.2` → `D = 8`, total `38` steps.
 - A crash mid-decay resumes correctly: the trigger state is saved inside the
   checkpoint, and a resumed decay continues from the original trigger step
   instead of restarting the decay.
-- `best.pt` and `final_model.pt` are uploaded to the W&B run as artifacts
-  (metadata: kind, stage, step, tokens seen, best val loss, git commit,
-  local path, W&B run id). Artifact upload failures only warn — they never
-  abort training. Periodic `latest.pt` / `step_<N>.pt` saves are local-only.
+- When `training.upload_artifacts=true`, `best.pt` and `final_model.pt` are
+  uploaded to the W&B run as artifacts (metadata: kind, stage, step, tokens
+  seen, best val loss, git commit, local path, W&B run id). Artifact upload
+  failures only warn — they never abort training. The default is `false`.
+  All local checkpoints, including periodic `latest.pt` / `step_<N>.pt` saves,
+  are still written locally regardless of this setting.
 
 ## Data behavior
 
 The pipeline performs the following steps:
 
-1. Read and concatenate local files, or load a Hugging Face dataset.
-2. Encode the text with the configured `tiktoken` tokenizer.
-3. Split the token stream by position into training and validation portions.
+1. Read and concatenate local files, or create a native Hugging Face stream.
+2. Encode text with the configured `tiktoken` tokenizer.
+3. Split the regular token stream by position; HF streams assign source rows
+   deterministically because their full token count is not known up front.
 4. Produce `(input, target)` pairs, where the target is the input shifted by one
-   token.
-5. Batch the windows with PyTorch `DataLoader`s.
+   token. HF streams do this one source example at a time.
+5. Batch the windows with PyTorch `DataLoader`s (or HF's stateful loader when
+   streaming workers are enabled).
 
 `stride` controls overlap. A stride equal to `seq_len` creates adjacent windows;
 a smaller stride creates overlapping examples. The corpus must be large enough
@@ -487,8 +526,8 @@ one complete training batch.
 
 - W&B metrics include training/validation loss, perplexity, learning rate,
   throughput, generated text samples, and model parameter counts. When W&B is
-  the backend, `best.pt` and `final_model.pt` are additionally uploaded to
-  the run page as artifacts.
+  the backend and `training.upload_artifacts=true`, `best.pt` and
+  `final_model.pt` are additionally uploaded to the run page as artifacts.
 - Terminal logging includes model parameter counts, training/evaluation loss,
   learning rate, and generated sample text.
 - Hydra stores run metadata and checkpoints under `runs/`. Each run directory

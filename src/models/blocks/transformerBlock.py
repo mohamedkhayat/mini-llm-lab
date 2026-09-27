@@ -1,9 +1,10 @@
 import torch.nn as nn
-from models.attention.gqa import GroupQueryAttention
-from models.normalization.layerNorm import LayerNorm
-from models.attention.mha import MultiHeadAttention
+
 from models.attention.fastmha import FastMultiHeadAttention
+from models.attention.gqa import GroupQueryAttention
+from models.attention.mha import MultiHeadAttention
 from models.feed_forward.ffn import FeedForward
+from models.normalization.normalization import get_norm
 
 
 class TransformerBlock(nn.Module):
@@ -11,14 +12,17 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, cfg):
         super().__init__()
-        self.norm1 = LayerNorm(cfg.emb_dim)
-        self.norm2 = LayerNorm(cfg.emb_dim)
+        # Older configs/checkpoints without a normalization key keep the
+        # original layer-norm behavior so they stay resumable.
+        norm_name = str(getattr(cfg, "normalization", "layer_norm"))
+        self.norm1 = get_norm(norm_name)(cfg.emb_dim)
+        self.norm2 = get_norm(norm_name)(cfg.emb_dim)
 
         attention_name = str(getattr(cfg, "attention", "mha")).lower()
         attention_impls = {
             "mha": MultiHeadAttention,
             "fastmha": FastMultiHeadAttention,
-            "gqa" : GroupQueryAttention
+            "gqa": GroupQueryAttention,
         }
         if attention_name not in attention_impls:
             choices = ", ".join(sorted(attention_impls))

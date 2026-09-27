@@ -142,7 +142,9 @@ def _checkpoint_options() -> dict[str, str]:
     return options
 
 
-def _load_checkpoint_config(checkpoint_path: Path, checkpoint: dict[str, Any]) -> DictConfig:
+def _load_checkpoint_config(
+    checkpoint_path: Path, checkpoint: dict[str, Any]
+) -> DictConfig:
     cfg = checkpoint.get("cfg")
     if cfg is not None:
         return OmegaConf.create(cfg)
@@ -174,9 +176,7 @@ def _load_state_dict(model: GptModel, state_dict: dict[str, Any]) -> None:
 def _configure_inference_runtime(cfg: DictConfig) -> tuple[Any, str]:
     """Apply the checkpoint's precision and Tensor Core settings for inference."""
     requested_bf16 = bool(_cfg_value(cfg, "training.use_bf16", False))
-    requested_tensor_cores = bool(
-        _cfg_value(cfg, "training.use_tensor_cores", False)
-    )
+    requested_tensor_cores = bool(_cfg_value(cfg, "training.use_tensor_cores", False))
 
     if DEVICE.type != "cuda":
         return (
@@ -200,9 +200,7 @@ def _configure_inference_runtime(cfg: DictConfig) -> tuple[Any, str]:
                 "This checkpoint requests BF16 inference, but the current "
                 "CUDA device does not support BF16."
             )
-        autocast_context = torch.autocast(
-            device_type="cuda", dtype=torch.bfloat16
-        )
+        autocast_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     else:
         autocast_context = nullcontext()
 
@@ -265,9 +263,7 @@ def get_model_and_tokenizer(model_path: str | Path) -> ModelBundle:
     model.to(DEVICE)
     model.eval()
 
-    summary = _model_summary(
-        checkpoint_path, model, cfg, checkpoint, runtime_summary
-    )
+    summary = _model_summary(checkpoint_path, model, cfg, checkpoint, runtime_summary)
     del checkpoint
     return ModelBundle(
         path=checkpoint_path,
@@ -396,7 +392,9 @@ def on_chat_end() -> None:
 async def main(message: cl.Message) -> None:
     bundle = cl.user_session.get("model_bundle")
     if bundle is None:
-        await cl.Message(content="No model is loaded. Select a checkpoint first.").send()
+        await cl.Message(
+            content="No model is loaded. Select a checkpoint first."
+        ).send()
         return
 
     generation = cl.user_session.get("generation_settings") or {

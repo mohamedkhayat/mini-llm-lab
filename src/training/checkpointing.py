@@ -4,10 +4,10 @@ One seam for restarts. The trainer gathers its live run state and hands it
 across the functions here; nothing else knows how a checkpoint is built or
 restored.
 
-Checkpoint payload format (frozen on disk, version 2) — the full key set,
+Checkpoint payload format (version 3; older versions remain readable) — the key set,
 assembled by ``build_checkpoint_payload``:
 
-    checkpoint_version   int, always 2
+    checkpoint_version   int, currently 3 (older versions are readable)
     model                model state dict
     model_cfg            resolved model config (plain dict)
     optimizer            optimizer state dict
@@ -24,6 +24,7 @@ assembled by ``build_checkpoint_payload``:
     rng                  all RNG streams: python, numpy, torch, cuda, dataloader
     cfg                  the full resolved config (plain dict)
     wsd                  the WSD state dict (format owned by ``training.schedule``)
+    data_state            optional native streaming/DataLoader state
 
 Legacy checkpoints may omit ``cursor``, ``tokens_seen``, ``rng``,
 ``scheduler``, ``wsd``, or ``total_steps`` / ``steps_per_epoch``; resume
@@ -36,11 +37,11 @@ can also reset the dataloader generators and the sampler's epoch).
 """
 
 import io
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import random
 import torch
 
 from training.run_manifest import atomic_write_bytes
@@ -132,6 +133,7 @@ def build_checkpoint_payload(
     rng_state,
     cfg_container,
     wsd_state,
+    data_state=None,
 ):
     """Assemble the restart-complete checkpoint payload (plain dict).
 
@@ -140,7 +142,7 @@ def build_checkpoint_payload(
     checkpoints without the key are tolerated on resume.
     """
     return {
-        "checkpoint_version": 2,
+        "checkpoint_version": 3,
         "model": model_state,
         "model_cfg": model_cfg,
         "optimizer": optimizer_state,
@@ -157,30 +159,86 @@ def build_checkpoint_payload(
         "rng": rng_state,
         "cfg": cfg_container,
         "wsd": wsd_state,
+        "data_state": data_state,
     }
 
 
+def capture_data_state(loader):
+    """Capture only the state owned by a stateful streaming training loader.
+
+    Ordinary map-style loaders already resume from the deterministic
+    ``epoch``/``batch_in_epoch`` cursor. The streaming path is single-
+    process, so the loader's state is the native dataset state. Keeping this
+    seam here avoids teaching the trainer about the implementation.
+    """
+    if not getattr(loader, "stream_stateful", False):
+        return None
+
+    dataset = getattr(loader, "checkpoint_dataset", None)
+    if dataset is None or not callable(getattr(dataset, "state_dict", None)):
+        raise RuntimeError("Streaming loader has no checkpointable dataset state")
+    return {"kind": "dataset", "state": dataset.state_dict()}
+
+
+def restore_data_state(loader, data_state) -> None:
+    """Restore a streaming loader's native state before iteration starts."""
+    if not data_state:
+        if getattr(loader, "stream_stateful", False):
+            print(
+                "Warning: checkpoint has no streaming data state; the model "
+                "and optimizer resume at the saved step, but the HF stream "
+                "restarts from the top of the corpus. This is a legacy "
+                "checkpoint without native stream state and is not a "
+                "bit-for-bit resume."
+            )
+        return
+    kind = data_state.get("kind")
+    if kind == "stateful_dataloader":
+        raise ValueError(
+            "This checkpoint saved forked-worker stream state "
+            "(StatefulDataLoader); the streaming path is now single-process "
+            "and cannot resume it. Start a fresh run or resume a "
+            "single-process checkpoint."
+        )
+    if kind == "dataset":
+        dataset = getattr(loader, "checkpoint_dataset", None)
+        if dataset is None or not callable(getattr(dataset, "load_state_dict", None)):
+            raise RuntimeError("Streaming loader cannot restore dataset state")
+        dataset.load_state_dict(data_state["state"])
+        return
+    raise ValueError(f"Unsupported streaming data-state kind: {kind!r}")
+
+
 def check_resume_consistency(
-    saved_total_steps, total_steps, saved_steps_per_epoch, steps_per_epoch, decay_run
+    saved_total_steps,
+    total_steps,
+    saved_steps_per_epoch,
+    steps_per_epoch,
+    decay_run,
+    continuation_run=False,
 ):
     """Validate resume compatibility between a checkpoint and the new config.
 
     Decay runs are exempt from the total-steps check: stage 2 re-derives its
     budget from the trigger step, so the configured budget may differ from
-    stage 1's. The steps-per-epoch check always applies because stage 2 must
-    keep the original data settings.
+    stage 1's. Stable continuation runs are also exempt because their new
+    total is ``saved_step + additional_steps``. The steps-per-epoch check
+    always applies because the data settings must remain compatible.
     """
     if (
         saved_total_steps is not None
         and int(saved_total_steps) != int(total_steps)
         and not decay_run
+        and not continuation_run
     ):
         raise ValueError(
             "The resume config produces a different total step budget "
             f"({int(total_steps)}) than the checkpoint ({int(saved_total_steps)}). "
             "Resume with the original training budget for an exact continuation."
         )
-    if saved_steps_per_epoch is not None and int(saved_steps_per_epoch) != int(steps_per_epoch):
+    if saved_steps_per_epoch is not None and int(saved_steps_per_epoch) != int(
+        steps_per_epoch
+    ):
         raise ValueError(
             "The resumed dataloader has a different number of batches per "
             "data pass. Keep the original data, seq_len, stride, batch_size, "
@@ -228,8 +286,12 @@ def restore_training_state(state: RunState, checkpoint: dict) -> None:
 
     saved_tokens = checkpoint.get("tokens_seen")
     state.tokens_seen = (
-        int(saved_tokens) if saved_tokens is not None else state.step * state.tokens_per_step
+        int(saved_tokens)
+        if saved_tokens is not None
+        else state.step * state.tokens_per_step
     )
+
+    restore_data_state(state.train_loader, checkpoint.get("data_state"))
 
     rng_state = checkpoint.get("rng")
     if rng_state is None:

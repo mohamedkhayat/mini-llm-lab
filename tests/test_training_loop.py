@@ -270,9 +270,9 @@ def build_stub_trainer(tmp_path, training_overrides=None, **attribute_overrides)
         "_manifest_git_commit": "deadbeef",
         "_manifest_config_digest": "cfg123",
     }
-    attributes["total_train_tokens"] = attributes["total_steps"] * attributes[
-        "tokens_per_step"
-    ]
+    attributes["total_train_tokens"] = (
+        attributes["total_steps"] * attributes["tokens_per_step"]
+    )
     for name, value in attributes.items():
         setattr(trainer, name, value)
     # The scheduler must wrap the same optimizer the loop steps.
@@ -313,9 +313,7 @@ def test_stop_flag_between_steps_writes_latest_and_logs_the_interrupt(tmp_path):
     trainer = build_stub_trainer(
         tmp_path, training_overrides={"eval_interval": 999}, total_steps=10
     )
-    trainer.train_loader = StoppingLoader(
-        trainer.train_loader, trainer, trip_after=4
-    )
+    trainer.train_loader = StoppingLoader(trainer.train_loader, trainer, trip_after=4)
 
     trainer.train()
 

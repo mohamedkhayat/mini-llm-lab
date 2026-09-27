@@ -18,7 +18,7 @@ def test_multi_head_attention_example():
     batch = torch.stack((inputs, inputs), dim=0)
 
     _, context_length, d_in = batch.shape
-    mha = MultiHeadAttention(d_in, 2, context_length, 0.0, num_heads=2)
+    mha = MultiHeadAttention(d_in, 2, context_length, 0.0, num_heads=2, num_kv_groups=2)
 
     context_vecs = mha(batch)
 

@@ -8,7 +8,7 @@ backend to an adapter:
 - ``WandbLogger`` — the W&B adapter. It owns the wandb import (isolated from
   the rest of the codebase), the "a resumed run keeps the original run's
   config and name" behavior, the computed-value config update, HTML sample
-  logging, and the never-fail artifact upload.
+  logging, and the optional never-fail artifact upload.
 - ``TerminalLogger`` — prints only. It holds no reference to W&B, so a
   terminal-mode run performs zero W&B interactions.
 
@@ -132,12 +132,13 @@ class TerminalLogger(RunLogger):
 class WandbLogger(RunLogger):
     """The W&B adapter: owns the wandb import and every W&B interaction."""
 
-    def __init__(self, wandb_module=None):
+    def __init__(self, wandb_module=None, upload_artifacts=False):
         if wandb_module is None:
             import wandb  # noqa: F401 — the import stays inside this adapter
 
             wandb_module = wandb
         self._wandb = wandb_module
+        self.upload_artifacts = bool(upload_artifacts)
         self.run_id = None
         self._run = None
 
@@ -201,6 +202,8 @@ class WandbLogger(RunLogger):
         )
 
     def log_checkpoint(self, kind, name, path, metadata) -> None:
+        if not self.upload_artifacts:
+            return
         # ``log_artifact`` never raises: an artifact failure only warns, so
         # a W&B outage cannot abort a long training run.
         log_artifact(self._wandb, path, name, metadata)
@@ -216,16 +219,16 @@ class WandbLogger(RunLogger):
             self._wandb.finish()
 
 
-def create_logger(log_backend: str) -> RunLogger:
+def create_logger(log_backend: str, upload_artifacts=False) -> RunLogger:
     """Map the resolved backend to its adapter."""
     if log_backend == "wandb":
-        return WandbLogger()
+        return WandbLogger(upload_artifacts=upload_artifacts)
     return TerminalLogger()
 
 
-def should_log_artifacts(log_backend) -> bool:
-    """W&B artifacts are only meaningful when W&B is the logging backend."""
-    return log_backend == "wandb"
+def should_log_artifacts(log_backend, upload_artifacts=False) -> bool:
+    """Return whether this run should upload checkpoint artifacts to W&B."""
+    return log_backend == "wandb" and bool(upload_artifacts)
 
 
 def build_artifact_metadata(

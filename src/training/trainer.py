@@ -113,7 +113,9 @@ class Trainer:
         )
 
         self.use_bf16 = bool(getattr(self.cfg.training, "use_bf16", False))
-        self.use_tensor_cores = bool(getattr(self.cfg.training, "use_tensor_cores", False))
+        self.use_tensor_cores = bool(
+            getattr(self.cfg.training, "use_tensor_cores", False)
+        )
         self.use_compile = bool(getattr(self.cfg.training, "compile", False))
         self.compile_mode = str(getattr(self.cfg.training, "compile_mode", "default"))
         self._configure_cuda_features()
@@ -186,7 +188,9 @@ class Trainer:
         )
 
         self.steps_per_epoch = len(self.train_loader)
-        self.tokens_per_step = int(self.cfg.data.batch_size) * int(self.cfg.data.seq_len)
+        self.tokens_per_step = int(self.cfg.data.batch_size) * int(
+            self.cfg.data.seq_len
+        )
 
         optimizer_kwargs = {
             "lr": float(self.cfg.training.lr),
@@ -220,9 +224,10 @@ class Trainer:
                 raise ValueError(
                     "training.resume_mode=continue requires training.resume_from."
                 )
-            if getattr(self.cfg.training, "max_steps", None) is not None or getattr(
-                self.cfg.training, "max_tokens", None
-            ) is not None:
+            if (
+                getattr(self.cfg.training, "max_steps", None) is not None
+                or getattr(self.cfg.training, "max_tokens", None) is not None
+            ):
                 raise ValueError(
                     "Stable continuation uses training.continue_tokens; clear "
                     "training.max_steps and training.max_tokens."
@@ -261,7 +266,9 @@ class Trainer:
             if self.resume_checkpoint is not None
             else None
         )
-        self.start_decay_requested = bool(getattr(self.cfg.training, "start_decay", False))
+        self.start_decay_requested = bool(
+            getattr(self.cfg.training, "start_decay", False)
+        )
         # Decidable before the step counter is restored: only whether a
         # decay triggers matters here (the true trigger step is filled in
         # after the restore), so resume_step=0 is a placeholder.
@@ -409,9 +416,9 @@ class Trainer:
             # Decay runs skip warmup (stage 1 already ran it); the decay
             # budget was derived from the trigger step in _apply_resume.
             warmup = 0
-            decay_steps = resolve_decay_budget(
-                self.wsd_decay["step"], decay_fraction
-            )[1]
+            decay_steps = resolve_decay_budget(self.wsd_decay["step"], decay_fraction)[
+                1
+            ]
         elif self.continuation_run:
             # The continuation is an extension of an already-trained stable
             # run. It must not introduce a second warmup window.
@@ -421,7 +428,9 @@ class Trainer:
             warmup = int(self.cfg.training.warmup_fraction * self.total_steps)
             decay_steps = int(decay_fraction * self.total_steps)
 
-        lr_lambda = build_lr_lambda(warmup, decay_steps, peak_lr, min_lr, self.wsd_decay)
+        lr_lambda = build_lr_lambda(
+            warmup, decay_steps, peak_lr, min_lr, self.wsd_decay
+        )
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer, lr_lambda=lr_lambda
         )
@@ -463,7 +472,9 @@ class Trainer:
         if self.wsd_decay["triggered"]:
             stage_marker["wsd_trigger_step"] = self.wsd_decay["step"]
         saved_cfg = (
-            self.resume_checkpoint.get("cfg") if self.resume_checkpoint is not None else None
+            self.resume_checkpoint.get("cfg")
+            if self.resume_checkpoint is not None
+            else None
         )
         self.logger.init(
             name=self.run_name,
@@ -532,10 +543,19 @@ class Trainer:
         self.tokens_seen = bundle.tokens_seen
 
     def _set_train_epoch(self, epoch):
-        """Set the deterministic sampler to the logical data-pass number."""
-        sampler = getattr(self.train_loader, "sampler", None)
-        if hasattr(sampler, "set_epoch"):
-            sampler.set_epoch(epoch)
+        """Set the deterministic sampler to the logical data-pass number.
+
+        The dedicated eval loader (map-style runs) shares the train
+        seed, so it needs the same epoch to stay on the same permutation.
+        """
+        loaders = [self.train_loader]
+        eval_loader = getattr(self.train_loader, "eval_loader", None)
+        if eval_loader is not None:
+            loaders.append(eval_loader)
+        for loader in loaders:
+            sampler = getattr(loader, "sampler", None)
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
 
     def _capture_rng_state(self):
         return {
@@ -634,12 +654,12 @@ class Trainer:
                 break
         return total_loss / num_batches
 
-    
-
     def generate_and_log_sample(self, loss=None):
         self.model.eval()
-        encoded = text_to_token_ids(self.cfg.training.start_context, self.tokenizer, device=self.device)
-        
+        encoded = text_to_token_ids(
+            self.cfg.training.start_context, self.tokenizer, device=self.device
+        )
+
         with torch.no_grad():
             token_ids = self.model.generate(
                 encoded,
@@ -676,7 +696,9 @@ class Trainer:
             getattr(self.cfg.training, "eval_batches", self.cfg.training.eval_interval)
         )
         with torch.no_grad():
-            train_eval_loader = getattr(self.train_loader, "eval_loader", self.train_loader)
+            train_eval_loader = getattr(
+                self.train_loader, "eval_loader", self.train_loader
+            )
             train_loss = self.calc_loss_loader(
                 train_eval_loader, num_batches=eval_batches
             )
@@ -966,7 +988,10 @@ class Trainer:
                 current_epoch = self.epoch
                 self._set_train_epoch(current_epoch)
                 for batch_idx, (x, y) in enumerate(self.train_loader):
-                    if not getattr(self.train_loader, "stream_stateful", False) and batch_idx < self.batch_in_epoch:
+                    if (
+                        not getattr(self.train_loader, "stream_stateful", False)
+                        and batch_idx < self.batch_in_epoch
+                    ):
                         continue
                     if self.step >= self.total_steps or self.stop_requested:
                         break

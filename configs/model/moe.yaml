@@ -11,7 +11,7 @@ n_layers: 28
 drop_rate: 0.0
 qkv_bias: false
 ffn_bias: false
-norm: rmsnorm
+normalization: rmsnorm
 activation: silu
 gated: true
 equalize_params: true

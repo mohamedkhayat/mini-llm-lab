@@ -60,6 +60,26 @@ def resolve_total_steps(training_cfg, steps_per_epoch, tokens_per_step):
     return total_steps, budget_name
 
 
+def resolve_continuation_steps(training_cfg, tokens_per_step):
+    """Convert a stable continuation's additional token budget to steps."""
+    requested_tokens = getattr(training_cfg, "continue_tokens", None)
+    if requested_tokens is None:
+        raise ValueError(
+            "training.resume_mode=continue requires training.continue_tokens."
+        )
+    requested_tokens = int(requested_tokens)
+    tokens_per_step = int(tokens_per_step)
+    if requested_tokens <= 0:
+        raise ValueError("training.continue_tokens must be positive")
+    steps = requested_tokens // tokens_per_step
+    if steps <= 0:
+        raise ValueError(
+            "training.continue_tokens must contain at least one complete "
+            "optimizer batch"
+        )
+    return steps
+
+
 def resolve_decay_budget(steps_done, decay_fraction):
     """Derive the WSD decay budget from where stage 1 stopped.
 
@@ -98,7 +118,11 @@ def resolve_wsd_state(saved_wsd, start_decay, resume_step):
     """
     saved = saved_wsd if isinstance(saved_wsd, dict) else {}
     saved_step = saved.get("step")
-    if saved.get("triggered") is True and isinstance(saved_step, int) and saved_step >= 0:
+    if (
+        saved.get("triggered") is True
+        and isinstance(saved_step, int)
+        and saved_step >= 0
+    ):
         return {"triggered": True, "step": saved_step}
     if start_decay:
         return {"triggered": True, "step": int(resume_step)}

@@ -27,9 +27,7 @@ BATCH_SIZE = 2
 # the odd rows are training: each training row (8 tokens + eot) yields two
 # non-overlapping windows of 4, so the three training rows (1, 3, 5) cover a
 # 3-step run at two windows per pass without needing to cycle the source.
-ROWS = [
-    " ".join(str(row * 8 + k) for k in range(8)) for row in range(7)
-]
+ROWS = [" ".join(str(row * 8 + k) for k in range(8)) for row in range(7)]
 
 
 class FakeStreamingSource:
@@ -66,7 +64,7 @@ class FakeTokenizer:
 
     eot_token = 35
 
-    def encode(self, text, allowed_special=None):
+    def encode(self, text, allowed_special=None, disallowed_special=()):
         return [int(value) for value in text.split()]
 
     def decode(self, ids):
@@ -251,9 +249,7 @@ def test_streaming_run_reports_the_window_token_total_for_a_max_steps_budget(
     assert "budget=max_steps" in out
 
 
-def test_streaming_run_rejects_a_max_tokens_budget_smaller_than_one_step(
-    streaming_run
-):
+def test_streaming_run_rejects_a_max_tokens_budget_smaller_than_one_step(streaming_run):
     """A window-token budget that does not cover one complete optimizer step
     cannot be converted to any step count, so it fails clearly instead of
     silently running zero steps."""
@@ -290,9 +286,7 @@ def test_streaming_progress_lines_label_throughput_as_window_tokens(
     out = capsys.readouterr().out
 
     progress_lines = [
-        line
-        for line in out.splitlines()
-        if "loss" in line and "tok/s" in line
+        line for line in out.splitlines() if "loss" in line and "tok/s" in line
     ]
 
     assert len(progress_lines) == 2
@@ -329,15 +323,19 @@ def test_nonstreaming_paths_keep_ignoring_data_max_tokens(monkeypatch, tmp_path)
     monkeypatch.chdir(tmp_path)
     corpus = tmp_path / "corpus.txt"
     corpus.write_text(" ".join(str(i % VOCAB) for i in range(400)), encoding="utf-8")
-    monkeypatch.setattr(dataloader_module, "get_tokenizer", lambda _name: FakeTokenizer())
+    monkeypatch.setattr(
+        dataloader_module, "get_tokenizer", lambda _name: FakeTokenizer()
+    )
 
-    cfg = streaming_cfg(data_overrides={
-        "source": "files",
-        "files": [str(corpus)],
-        "streaming": False,
-        "max_tokens": 1000,
-        "val_ratio": 0.1,
-    })
+    cfg = streaming_cfg(
+        data_overrides={
+            "source": "files",
+            "files": [str(corpus)],
+            "streaming": False,
+            "max_tokens": 1000,
+            "val_ratio": 0.1,
+        }
+    )
 
     train_loader, val_loader = create_dataloaders(cfg.data, training_cfg=cfg.training)
 

@@ -6,6 +6,9 @@ use_bf16: false
 use_tensor_cores: false
 # Select ``wandb`` or ``terminal``. WANDB_MODE=disabled also selects terminal.
 log_backend: wandb
+# Upload full checkpoint files to W&B as artifacts. This is expensive for
+# large models; local checkpoints are always written regardless of this flag.
+upload_artifacts: false
 # ``max_steps`` or ``max_tokens`` overrides the epoch fallback. If both are
 # set, the trainer raises an error to avoid an ambiguous training budget.
 max_steps: null
@@ -34,6 +37,10 @@ log_interval: 10
 save_interval: null
 # Explicit checkpoint path, or ``latest``/``auto`` for the newest latest.pt.
 resume_from: null
+# ``exact`` keeps the original total budget. ``continue`` resumes an
+# untriggered stable checkpoint and adds ``continue_tokens`` at plateau LR.
+resume_mode: exact
+continue_tokens: null
 seed: 42
 start_context: Every effort moves you
 max_new_tokens: 50

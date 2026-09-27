@@ -62,8 +62,9 @@ class AlwaysFailingWandb:
 
 
 def test_should_log_artifacts_follows_the_backend():
-    assert should_log_artifacts("wandb") is True
-    assert should_log_artifacts("terminal") is False
+    assert should_log_artifacts("wandb", upload_artifacts=True) is True
+    assert should_log_artifacts("wandb", upload_artifacts=False) is False
+    assert should_log_artifacts("terminal", upload_artifacts=True) is False
 
 
 def test_build_artifact_metadata_records_the_identifying_fields():
@@ -168,7 +169,7 @@ def test_terminal_adapter_performs_no_wandb_interaction(monkeypatch):
 
 def test_wandb_adapter_logs_the_artifact_through_the_interface():
     fake = FakeWandb()
-    logger = WandbLogger(wandb_module=fake)
+    logger = WandbLogger(wandb_module=fake, upload_artifacts=True)
     logger.log_checkpoint(
         "best",
         "best-checkpoint",
@@ -188,6 +189,15 @@ def test_wandb_adapter_logs_the_artifact_through_the_interface():
     assert len(fake.logged) == 1
     assert fake.logged[0].metadata["stage"] == "stage-2-decay"
     assert fake.logged[0].metadata["step"] == 38
+
+
+def test_wandb_adapter_skips_artifact_uploads_by_default():
+    fake = FakeWandb()
+    logger = WandbLogger(wandb_module=fake)
+
+    logger.log_checkpoint("best", "best-checkpoint", "best.pt", {"kind": "best"})
+
+    assert fake.logged == []
 
 
 def test_wandb_adapter_resumed_run_keeps_the_original_config_and_name():

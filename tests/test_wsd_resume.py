@@ -91,6 +91,17 @@ def test_decay_run_budget_mismatch_is_accepted():
     )
 
 
+def test_stable_continuation_budget_mismatch_is_accepted():
+    check_resume_consistency(
+        saved_total_steps=60,
+        total_steps=91,
+        saved_steps_per_epoch=40,
+        steps_per_epoch=40,
+        decay_run=False,
+        continuation_run=True,
+    )
+
+
 def test_steps_per_epoch_mismatch_is_rejected_even_for_decay_runs():
     with pytest.raises(ValueError, match="batches per"):
         check_resume_consistency(

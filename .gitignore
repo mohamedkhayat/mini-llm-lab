@@ -230,4 +230,6 @@ checkpoints/
 .scratch/
 .agents/
 .codex/
+.pi/
+TODO.md
 LEARNING_LOG.md

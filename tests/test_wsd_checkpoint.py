@@ -1,7 +1,9 @@
 from training.checkpointing import (
     atomic_torch_save,
     build_checkpoint_payload,
+    capture_data_state,
     load_checkpoint,
+    restore_data_state,
 )
 
 
@@ -38,11 +40,45 @@ def test_checkpoint_payload_carries_the_triggered_wsd_state():
 
 
 def test_checkpoint_payload_carries_the_untriggered_wsd_state():
-    payload = build_checkpoint_payload(**_payload(
-        wsd_state={"triggered": False, "step": None}
-    ))
+    payload = build_checkpoint_payload(
+        **_payload(wsd_state={"triggered": False, "step": None})
+    )
 
     assert payload["wsd"] == {"triggered": False, "step": None}
+
+
+def test_checkpoint_payload_can_carry_native_stream_state():
+    stream_state = {"kind": "dataset", "state": {"source_pass": 0}}
+
+    payload = build_checkpoint_payload(**_payload(data_state=stream_state))
+
+    assert payload["data_state"] == stream_state
+
+
+def test_stream_state_capture_and_restore_use_the_loader_seam():
+    class DatasetState:
+        def __init__(self):
+            self.saved = {"position": 3}
+
+        def state_dict(self):
+            return dict(self.saved)
+
+        def load_state_dict(self, state):
+            self.saved = dict(state)
+
+    class Loader:
+        stream_stateful = True
+
+        def __init__(self):
+            self.checkpoint_dataset = DatasetState()
+
+    loader = Loader()
+    saved = capture_data_state(loader)
+    loader.checkpoint_dataset.saved = {"position": 0}
+    restore_data_state(loader, saved)
+
+    assert saved == {"kind": "dataset", "state": {"position": 3}}
+    assert loader.checkpoint_dataset.saved == {"position": 3}
 
 
 def test_saved_checkpoint_roundtrips_the_wsd_state(tmp_path):
@@ -51,6 +87,26 @@ def test_saved_checkpoint_roundtrips_the_wsd_state(tmp_path):
 
     checkpoint = load_checkpoint(path)
     assert checkpoint["wsd"] == {"triggered": True, "step": 30}
+
+
+def test_streaming_resume_without_data_state_warns(capsys):
+    class Loader:
+        stream_stateful = True
+
+    restore_data_state(Loader(), None)
+
+    out = capsys.readouterr().out
+    assert "Warning" in out
+    assert "restarts" in out
+
+
+def test_non_streaming_resume_without_data_state_stays_silent(capsys):
+    class Loader:
+        stream_stateful = False
+
+    restore_data_state(Loader(), None)
+
+    assert capsys.readouterr().out == ""
 
 
 def test_legacy_checkpoint_without_wsd_key_is_tolerated_on_resume():

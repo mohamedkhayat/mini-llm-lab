@@ -5,9 +5,12 @@ from models.feed_forward.utils import equalize_params
 
 class FeedForward(nn.Module):
     def __init__(self, cfg):
+        # this works for no gate + whatever activation and works for gated + swish, but I need to check if it works for other combos
         super().__init__()
-        activation_impls = {"gelu" : GeLU(), "silu": nn.SiLU(), "sigmoid": nn.Sigmoid()}
-        hidden_dim = equalize_params(cfg.hidden_dim, cfg.gated, do_equalize= cfg.equalize_params)
+        activation_impls = {"gelu": GeLU(), "silu": nn.SiLU(), "sigmoid": nn.Sigmoid()}
+        hidden_dim = equalize_params(
+            cfg.hidden_dim, cfg.gated, do_equalize=cfg.equalize_params
+        )
         self.fc1 = nn.Linear(cfg.emb_dim, hidden_dim, bias=cfg.ffn_bias)
         self.activation = activation_impls[cfg.activation]
         self.out = nn.Linear(hidden_dim, cfg.emb_dim, bias=cfg.ffn_bias)

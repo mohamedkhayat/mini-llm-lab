@@ -87,7 +87,9 @@ def _ensure_sample_data(root: Path | None = None) -> str:
     return verdict_path.read_text(encoding="utf-8")
 
 
-def _create_tokenized_dataloaders(cache_dir: Path, cfg) -> tuple[DataLoader, DataLoader]:
+def _create_tokenized_dataloaders(
+    cache_dir: Path, cfg
+) -> tuple[DataLoader, DataLoader]:
     from data.token_shards import TokenShardDataset, load_manifest
 
     manifest = load_manifest(cache_dir)
@@ -113,11 +115,45 @@ def _create_tokenized_dataloaders(cache_dir: Path, cfg) -> tuple[DataLoader, Dat
     return _create_dataloaders_from_datasets(train_ds, val_ds, cfg)
 
 
-def _create_hf_streaming_dataloaders(cfg, training_cfg) -> tuple[DataLoader, DataLoader]:
+def _create_hf_streaming_dataloaders(
+    cfg, training_cfg
+) -> tuple[DataLoader, DataLoader]:
+    # Lazy: importing training.schedule at module level would cycle through
+    # training/__init__ -> trainer -> data.dataloader.
     from data.hf_streaming import HFStreamingWindowDataset
+    from training.schedule import resolve_total_steps
 
     num_workers = int(getattr(cfg, "num_workers", 0))
+    if num_workers > 0:
+        raise ValueError(
+            "HF streaming runs are single-process: set data.num_workers=0. "
+            "Forked DataLoader workers import datasets inside the child "
+            "process, which breaks wandb's import hooks; rows are tokenized "
+            "on the main thread."
+        )
     batch_size = int(cfg.batch_size)
+    # The train stream uses ONE long-lived iterator per pass: max_samples
+    # covers the whole optimizer budget. HF's shuffle buffer is not
+    # checkpointed; with a per-batch iterator, every batch would resume
+    # from the saved state and refill the buffer, silently dropping roughly
+    # buffer_size rows (and spamming the log) on each resume. With a
+    # long-lived iterator the buffer stays alive; it is refilled only on
+    # pass boundaries and on a real checkpoint restore (one ~buffer_size
+    # row skip, negligible against the budget).
+    budget_windows = batch_size
+    if training_cfg is not None and (
+        getattr(training_cfg, "max_steps", None) is not None
+        or getattr(training_cfg, "max_tokens", None) is not None
+    ):
+        try:
+            total_steps, _ = resolve_total_steps(
+                training_cfg, 1, batch_size * int(cfg.seq_len)
+            )
+        except ValueError:
+            pass  # Invalid budget: keep the legacy one-batch iterator; the
+            # trainer's streaming budget check raises the precise error.
+        else:
+            budget_windows = int(total_steps) * batch_size
     eval_batches = int(
         getattr(
             training_cfg,
@@ -145,45 +181,36 @@ def _create_hf_streaming_dataloaders(cfg, training_cfg) -> tuple[DataLoader, Dat
     train_ds = HFStreamingWindowDataset(
         **common,
         split_name="train",
-        max_samples=batch_size,
+        max_samples=budget_windows,
         persistent_state=True,
     )
+    # Eval datasets skip the HF .shuffle() wrapper: on datasets 5.x +
+    # pyarrow it retains ~10GB of host RAM per live instance, and every
+    # eval materializes two of them on top of the train stream, which
+    # OOMed a 60GiB machine at the first eval. Eval is a bounded loss
+    # estimate over the already-upstream-shuffled corpus, so it uses the
+    # unshuffled streaming path (flat ~1GB, measured).
+    eval_common = {**common, "shuffle": False}
     val_ds = HFStreamingWindowDataset(
-        **common,
+        **eval_common,
         split_name="val",
         max_samples=max(1, eval_batches * batch_size),
         persistent_state=False,
     )
     train_eval_ds = HFStreamingWindowDataset(
-        **common,
+        **eval_common,
         split_name="train",
         max_samples=max(1, eval_batches * batch_size),
         persistent_state=False,
     )
 
-    loader_cls = DataLoader
-    if num_workers > 0:
-        try:
-            from torchdata.stateful_dataloader import StatefulDataLoader
-        except ImportError as exc:
-            raise ImportError(
-                "HF streaming with data.num_workers>0 requires torchdata's "
-                "StatefulDataLoader so worker-local HF stream state can be "
-                "checkpointed. Install the project dependencies or set "
-                "data.num_workers=0."
-            ) from exc
-        loader_cls = StatefulDataLoader
-
     print(
         f"Using streaming HF dataset: {cfg.hf_dataset} "
-        "(native IterableDataset state; no corpus buffering or project HF shards)"
+        "(native IterableDataset state; single-process; "
+        "no corpus buffering or project HF shards)"
     )
-    train_loader, val_loader = _create_dataloaders_from_datasets(
-        train_ds, val_ds, cfg, loader_cls=loader_cls
-    )
-    train_eval_loader, _ = _create_dataloaders_from_datasets(
-        train_eval_ds, val_ds, cfg, loader_cls=loader_cls
-    )
+    train_loader, val_loader = _create_dataloaders_from_datasets(train_ds, val_ds, cfg)
+    train_eval_loader, _ = _create_dataloaders_from_datasets(train_eval_ds, val_ds, cfg)
     train_loader.stream_stateful = True
     train_loader.checkpoint_dataset = train_ds
     train_loader.eval_loader = train_eval_loader
@@ -319,7 +346,7 @@ class EpochRandomSampler(Sampler[int]):
 
 
 def _create_dataloaders_from_datasets(
-    train_ds: Dataset, val_ds: Dataset, cfg, loader_cls=DataLoader
+    train_ds: Dataset, val_ds: Dataset, cfg
 ) -> tuple[DataLoader, DataLoader]:
     """Create loaders for either in-memory or memory-mapped datasets."""
     # --- DataLoaders ---
@@ -328,25 +355,22 @@ def _create_dataloaders_from_datasets(
     seed = int(getattr(cfg, "seed", 42))
 
     if isinstance(train_ds, IterableDataset):
-        train_loader = loader_cls(
+        # Streaming datasets are iterated on the main thread only (the
+        # dataloader entry point refuses num_workers > 0 for them), so
+        # persistent_workers is meaningless here.
+        train_loader = DataLoader(
             train_ds,
             batch_size=bs,
             drop_last=bool(getattr(cfg, "drop_last", True)),
-            num_workers=nw,
+            num_workers=0,
             pin_memory=bool(getattr(cfg, "pin_memory", True)),
-            persistent_workers=bool(getattr(cfg, "persistent_workers", True))
-            if nw > 0
-            else False,
         )
-        val_loader = loader_cls(
+        val_loader = DataLoader(
             val_ds,
             batch_size=bs,
             drop_last=False,
-            num_workers=nw,
+            num_workers=0,
             pin_memory=bool(getattr(cfg, "pin_memory", True)),
-            persistent_workers=bool(getattr(cfg, "persistent_workers", True))
-            if nw > 0
-            else False,
         )
         return train_loader, val_loader
 
@@ -389,5 +413,27 @@ def _create_dataloaders_from_datasets(
             "The training DataLoader has no batches; reduce batch_size or "
             "set drop_last=false."
         )
+
+    # Dedicated eval loader over the same dataset and a same-seed sampler.
+    # Trainer.evaluate() must never call iter() on the train loader itself:
+    # with persistent_workers and num_workers > 0, PyTorch reuses ONE
+    # iterator object across iter() calls and _reset() rewinds the sampler
+    # stream to batch 0 of the epoch permutation, so an eval would send the
+    # training stream back to the top of the pass every eval_interval steps
+    # (loss-curve sawtooth with period == eval_interval). Same seed+epoch
+    # means the same permutation, i.e. the first N batches of the pass.
+    eval_sampler = EpochRandomSampler(
+        train_ds,
+        seed=seed,
+        shuffle=bool(getattr(cfg, "shuffle", True)),
+    )
+    train_loader.eval_loader = DataLoader(
+        train_ds,
+        batch_size=bs,
+        sampler=eval_sampler,
+        drop_last=bool(getattr(cfg, "drop_last", True)),
+        num_workers=0,
+        pin_memory=bool(getattr(cfg, "pin_memory", True)),
+    )
 
     return train_loader, val_loader

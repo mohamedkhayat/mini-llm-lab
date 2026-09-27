@@ -4,8 +4,10 @@ from types import SimpleNamespace
 import pytest
 
 from training.log_backend import resolve_log_backend
+from training.trainer import Trainer
 from training.schedule import (
     build_lr_lambda,
+    resolve_continuation_steps,
     resolve_decay_budget,
     resolve_total_steps,
 )
@@ -55,6 +57,47 @@ def test_step_and_token_budgets_cannot_both_be_set():
 
     with pytest.raises(ValueError, match="only one"):
         resolve_total_steps(cfg, steps_per_epoch=20, tokens_per_step=32)
+
+
+def test_stable_continuation_uses_additional_complete_optimizer_steps():
+    cfg = SimpleNamespace(continue_tokens=1000)
+
+    assert resolve_continuation_steps(cfg, tokens_per_step=32) == 31
+
+
+def test_stable_continuation_requires_a_complete_optimizer_step():
+    cfg = SimpleNamespace(continue_tokens=31)
+
+    with pytest.raises(ValueError, match="complete optimizer batch"):
+        resolve_continuation_steps(cfg, tokens_per_step=32)
+
+
+def test_trainer_stable_continuation_extends_the_saved_step_budget():
+    trainer = Trainer.__new__(Trainer)
+    trainer.cfg = SimpleNamespace(
+        training=SimpleNamespace(
+            resume_mode="continue",
+            continue_tokens=96,
+            max_steps=None,
+            max_tokens=None,
+            epochs=1,
+            start_decay=False,
+        )
+    )
+    trainer.resume_checkpoint = {
+        "step": 7,
+        "total_steps": 7,
+        "steps_per_epoch": 2,
+        "wsd": {"triggered": False, "step": None},
+    }
+    trainer.steps_per_epoch = 2
+    trainer.tokens_per_step = 32
+
+    trainer._resolve_budget()
+
+    assert trainer.continuation_run is True
+    assert trainer.total_steps == 10
+    assert trainer.budget_name == "continue_tokens"
 
 
 def test_warmup_ramps_linearly_then_holds_the_peak_plateau():
@@ -230,5 +273,7 @@ def test_wsd_cosine_shape_matches_the_reference_formula():
     min_scale = floor / peak
     for step in range(s, s + d + 5):
         progress = min(max(step - s, 0) / d, 1.0)
-        expected = min_scale + (1.0 - min_scale) * 0.5 * (1.0 + math.cos(math.pi * progress))
+        expected = min_scale + (1.0 - min_scale) * 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
         assert lr_lambda(step) == pytest.approx(expected, rel=1e-12)

@@ -10,9 +10,8 @@ system or a package of pretrained models.
 
 ## What is implemented
 
-- GPT-style next-token datasets built from sliding windows
-- Local text-file and Hugging Face dataset inputs, plus memory-mapped token
-  caches for large corpora
+- GPT-style next-token batches read from sequential memory-mapped token caches
+- Hugging Face parquet dataset input with resumable local preprocessing
 - GPT-2 tokenization through `tiktoken`
 - Hugging Face dataset tokenization into a local, resumable token cache
   (`train.bin` / `eval.bin`), scanned sequentially by a memmap dataloader
@@ -35,7 +34,7 @@ instantiate the same `GptModel` implementation with different dimensions.
 ```text
 mini-llm-lab/
 ├── configs/                 # Composable Hydra configuration
-│   ├── data/                # Local-file and Hugging Face inputs
+│   ├── data/                # HF preparation, token caches, and memmap loader
 │   ├── model/               # GPT-2, Qwen-style, and MoE settings
 │   └── training/            # Optimizer and run settings
 ├── src/
@@ -65,7 +64,8 @@ system, then install this project.
 
 Training runs from a Hugging Face dataset. Before training, `train.py`
 tokenizes `data.hf_dataset` into a local cache at
-`data/<dataset>/<tokenizer_name>/` (`train.bin`, `eval.bin`, `meta.json`) —
+`data/<dataset>[__<config>]/<tokenizer_name>/` (`train.bin`, `eval.bin`,
+`meta.json`) —
 see "Data preparation" below; an existing valid cache is reused.
 
 The default dataset is set in `configs/data/default.yaml`. Point a run at any
@@ -129,7 +129,8 @@ The main config groups are:
 For example:
 
 ```bash
-python train.py data=hf_dataset model=gpt2 training.device=cuda
+python train.py data.hf_dataset=Salesforce/wikitext \
+  data.hf_config=wikitext-2-raw-v1 model=gpt2 training.device=cuda
 ```
 
 Use Hydra's built-in help and config inspection when you need the composed
@@ -148,13 +149,13 @@ parameter is only present in another preset.
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `data.hf_dataset` | `HuggingFaceFW/finepdfs_edu_50BT-dclm_30BT-fineweb_edu_20BT-shuffled` | Hugging Face dataset repository name (parquet). `train.py` tokenizes it into `data/<dataset>/<tokenizer_name>/` when that cache is missing or stale. |
+| `data.hf_dataset` | `HuggingFaceFW/finepdfs_edu_50BT-dclm_30BT-fineweb_edu_20BT-shuffled` | Hugging Face dataset repository name (parquet). `train.py` tokenizes it into the local cache when that cache is missing or stale. |
 | `data.hf_config` | `null` | Optional dataset configuration or subset. |
 | `data.revision` | `null` | Optional immutable Hugging Face revision. Cache expansion reuses the revision recorded in `meta.json` when this is null. |
 | `data.text_column` | `text` | Field read from each Hugging Face example during preparation. |
 | `data.file_format` | `parquet` | File format of the downloaded dataset, passed to the preparation step. |
 | `data.tokenizer_name` | `gpt2` | `tiktoken` encoding name used for the tokenized cache. The model's `vocab_size` must be compatible with the selected tokenizer. |
-| `data.max_tokens` | `6000000000` | Total tokens the preparation step caches (train + eval, split by `data.val_ratio`). It may be written as `6b`; the launcher expands it automatically when a requested phase endpoint needs more train capacity. |
+| `data.max_tokens` | `6000000000` | Total tokens the preparation step caches (train + eval, split by `data.val_ratio`). It may be written as `6b`. A fresh `training.train_tokens` budget must fit this cache; additive stable/decay phases expand it automatically when needed. |
 | `data.seq_len` | `1024` | Number of input tokens in each training example. Each target is the same window shifted one token to the right. Must not exceed `model.context_length`. |
 | `data.val_ratio` | `0.1` | Validation fraction of the tokenized cache. The split is positional at preparation time, so validation windows never contain training tokens. |
 
@@ -221,10 +222,11 @@ its selected phase-1 budget.
 | `model.n_layers` | `12` | Number of transformer blocks. |
 | `model.drop_rate` | `0.1` | Dropout probability used in embeddings, attention, and residual blocks. |
 | `model.qkv_bias` | `false` | Add bias terms to query, key, and value projections. |
-| `model.norm` | `layernorm` | Normalization label in the config. The current `GptModel` implementation uses its LayerNorm implementation regardless of this label; an `RMSNorm` module exists under `src/models/normalization/` but is not dispatched yet. |
+| `model.normalization` | `layernorm` | Normalization implementation: `layernorm` or `rmsnorm`. The lookup is case- and underscore-insensitive. |
 | `model.activation` | `gelu` | Feed-forward activation, dispatched by name: `gelu`, `silu`, or `sigmoid`. |
 | `model.hidden_dim` | `3072` | Feed-forward hidden width. With `gated=true`, `equalize_params=true` shrinks it to two-thirds so the three gated matrices match the parameter count of the ungated width. |
 | `model.gated` | `false` | Use a gated SwiGLU-style feed-forward: a second upcast projection multiplies the activated hidden stream elementwise. |
+| `model.equalize_params` | `true` | When `gated=true`, shrink the hidden width by two-thirds so the gated FFN has roughly the ungated parameter count. |
 | `model.ffn_bias` | `false` | Add bias terms to the feed-forward linear layers. |
 | `model.position_embedding` | `absolute` | Position-encoding label. The active GPT implementation uses learned absolute positional embeddings; RoPE is not yet dispatched. |
 | `model.residual_style` | `serial` | Residual-layout label. The active transformer block uses serial pre-norm residual connections. |
@@ -236,11 +238,11 @@ its selected phase-1 budget.
 The `moe` preset also contains `num_experts`,
 `num_experts_per_token`, and `shared_expert` fields. They describe planned
 Mixture-of-Experts behavior but are not consumed by the current `GptModel`.
-Likewise, the Qwen-style `rmsnorm` and `rope` labels are config
-metadata rather than active implementations; its gated SiLU feed-forward,
-grouped-query attention dimensions, and tied embeddings are real. Use
-`model=gpt2` for the supported end-to-end training path until a model
-factory is added.
+The Qwen-style preset's RMSNorm and gated SiLU feed-forward are active, while
+its `rope`/`rope_theta` settings are metadata only. GQA is available when
+`model.attention=gqa`, but the current Qwen preset still selects `mha`. Use
+`model=gpt2` for the supported end-to-end training path until a model factory
+is added.
 
 | Parameter | MoE default | Description |
 | --- | --- | --- |
@@ -312,14 +314,20 @@ by Git.
 ### Data preparation
 
 `train.py` tokenizes `data.hf_dataset` before training: it downloads the
-dataset, encodes it with `data.tokenizer_name`, appends an end-of-text token
-after every example, and writes the first `data.max_tokens` tokens to
-`data/<dataset>/<tokenizer_name>/` — `train.bin`, `eval.bin` (the
+dataset snapshot, reads the configured text column with PyArrow, encodes it
+with `data.tokenizer_name`, appends an end-of-text token after every example,
+and writes the first `data.max_tokens` tokens to
+`data/<dataset>[__<config>]/<tokenizer_name>/` — `train.bin`, `eval.bin` (the
 `data.val_ratio` split), and a `meta.json` recording the dataset identity,
-tokenizer, split counts, validation ratio, and storage dtype (`uint16` when the
-vocabulary fits, else `uint32`). The cache is reused only when those identity,
-metadata, and file-size invariants satisfy the run; a missing, stale, or
-undersized cache is re-prepared.
+source revision, tokenizer, split counts, validation ratio, and storage dtype
+(`uint16` when the vocabulary fits, else `uint32`). A cache is reused only when
+its metadata, file sizes, split geometry, and requested capacity are compatible
+with the run; a missing, stale, or undersized cache is re-prepared.
+
+Preparation writes sidecar files and installs them atomically. When an
+additive phase needs a larger cache, the old training prefix is compared with
+the regenerated prefix before replacement, so a changed dataset revision cannot
+silently invalidate a saved training cursor.
 
 The trainer scans the files sequentially through `np.memmap` (one data pass
 is one scan of `train.bin`), so neither preparation nor training materializes
@@ -445,21 +453,27 @@ tokens).
 
 ## Data behavior
 
-The pipeline performs the following steps:
+The current pipeline performs the following steps:
 
-1. Read and concatenate local files, or create a native Hugging Face stream.
-2. Encode text with the configured `tiktoken` tokenizer.
-3. Split the regular token stream by position; HF streams assign source rows
-   deterministically because their full token count is not known up front.
-4. Produce `(input, target)` pairs, where the target is the input shifted by one
-   token. HF streams do this one source example at a time.
-5. Batch the windows with PyTorch `DataLoader`s (or HF's stateful loader when
-   streaming workers are enabled).
+1. Download a Hugging Face dataset snapshot at `data.revision` (or reuse the
+   cached source revision during an expansion).
+2. Read the configured text column in PyArrow batches, tokenize with
+   `data.tokenizer_name`, and append one end-of-text token per source row.
+3. Write exactly `data.max_tokens` tokens into temporary `train.bin` and
+   `eval.bin` files. The train/eval sizes are derived from `data.val_ratio`, so
+   `floor((1 - val_ratio) * max_tokens)` tokens go to train and the remainder
+   go to validation. A source row may cross that boundary; its tokens are not
+   dropped.
+4. Validate metadata and byte sizes, then atomically install the cache.
+5. Read the cache sequentially with `MemmapDataLoader`. Each batch contains
+   contiguous windows; targets are the same tokens shifted by one position.
+   The final lookahead token needed for the shift is taken from the next cache
+   position, and incomplete final batches are dropped.
 
-`stride` controls overlap. A stride equal to `seq_len` creates adjacent windows;
-a smaller stride creates overlapping examples. The corpus must be large enough
-for at least one full window in both splits and, when `drop_last=true`, at least
-one complete training batch.
+The training loader has one cursor per data pass. Evaluation uses fresh shadow
+loaders, so validation never consumes or rewinds the training cursor. A phase
+budget caps how many complete optimizer steps may be taken from the train file;
+it does not create a second copy of the data.
 
 ## Outputs
 
@@ -496,17 +510,17 @@ after the model is loaded.
 pytest
 ```
 
-The test suite covers causal attention, model-config validation, token-shard
-datasets, checkpoint state, the training schedule (including the WSD two-stage
-budget, resume consistency, the run manifest, and W&B artifacts), and six
-end-to-end training-loop behaviors (budget stop, signal/KeyboardInterrupt
-stops, best-checkpoint improvement, periodic saves, and resume step) driven
-on a stub-constructed trainer without GPU, W&B, or corpora.
+The test suite covers causal attention, model-config validation, normalization
+and FFN dispatch, cache-budget parsing and validation, memmap cursor behavior,
+checkpoint state, the training schedule (including the WSD two-stage budget,
+resume consistency, the run manifest, and W&B artifacts), and end-to-end
+training-loop behaviors driven on a stub-constructed trainer without GPU, W&B,
+or a downloaded corpus.
 
 ## Roadmap
 
 - Expand the GPT-2-style transformer stack
-- Add RoPE and dispatch RMSNorm (the module exists but is not wired in)
+- Add RoPE and wire the Qwen preset to its intended positional encoding
 - Add sparse Mixture-of-Experts routing
 - Add a model factory for the Qwen and MoE configurations
 - Add richer evaluation controls

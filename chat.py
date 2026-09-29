@@ -103,19 +103,10 @@ def _format_count(value: int | None) -> str:
 
 
 def _planned_training_description(cfg: DictConfig | None) -> str:
-    max_tokens = _cfg_value(cfg, "training.max_tokens")
-    if max_tokens is not None:
-        return f"{_format_count(int(max_tokens))} tokens"
-
-    max_steps = _cfg_value(cfg, "training.max_steps")
-    batch_size = _cfg_value(cfg, "data.batch_size")
-    seq_len = _cfg_value(cfg, "data.seq_len")
-    if max_steps is not None and batch_size is not None and seq_len is not None:
-        tokens = int(max_steps) * int(batch_size) * int(seq_len)
-        return f"{_format_count(tokens)} tokens"
-
-    epochs = _cfg_value(cfg, "training.epochs")
-    return f"{epochs} epochs" if epochs is not None else "budget unknown"
+    data_max_tokens = _cfg_value(cfg, "data.max_tokens")
+    if data_max_tokens is not None:
+        return f"≤ {_format_count(int(data_max_tokens))} tokens (one pass over the data)"
+    return "budget unknown"
 
 
 def _checkpoint_label(info: CheckpointInfo) -> str:
@@ -222,10 +213,11 @@ def _model_summary(
 ) -> str:
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     step = checkpoint.get("step")
-    batch_size = _cfg_value(cfg, "data.batch_size")
+    batch_size = _cfg_value(cfg, "training.batch_size")
     seq_len = _cfg_value(cfg, "data.seq_len")
+    accum_steps = int(_cfg_value(cfg, "training.accum_steps") or 1)
     if step is not None and batch_size is not None and seq_len is not None:
-        trained_tokens = int(step) * int(batch_size) * int(seq_len)
+        trained_tokens = int(step) * int(batch_size) * int(seq_len) * accum_steps
         token_text = _format_count(trained_tokens)
     else:
         token_text = _planned_training_description(cfg)

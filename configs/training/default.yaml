@@ -9,24 +9,35 @@ log_backend: wandb
 # Upload full checkpoint files to W&B as artifacts. This is expensive for
 # large models; local checkpoints are always written regardless of this flag.
 upload_artifacts: false
-# ``max_steps`` or ``max_tokens`` overrides the epoch fallback. If both are
-# set, the trainer raises an error to avoid an ambiguous training budget.
-max_steps: null
-max_tokens: null
-epochs: 10
 lr: 5e-4
 weight_decay: 0.1
+
+# Micro-batch windows per data pull and optimizer steps per update: the
+# effective batch is batch_size x accum_steps. Gradients are summed over
+# the accum_steps micro-batches, then one optimizer + LR step is taken;
+# the budget and token counters count the effective batch.
+
+batch_size: 8
+accum_steps: 8
+beta1: 0.9
+beta2: 0.95
+
+# Absolute phase-1 budget for a fresh run. Values may be written as plain
+# integers or decimal suffixes such as 1.2b and 100m. Null means use the
+# available cached train capacity.
+train_tokens: null
+
 # Fraction of the stage-1 budget used for the linear learning-rate warmup.
 # Decay runs (start_decay) skip warmup entirely — it already happened in
 # stage 1. Must be >= 0.
 warmup_fraction: 0.1
 # Learning-rate floor reached at the end of the WSD decay. Must be positive
 # and no greater than `lr`.
-min_lr: 1e-5
-# Fraction of the FINAL run occupied by the decay (must be in (0, 1)). In a
-# two-stage run that starts decaying at resume step S, the decay lasts
-# D = round(S*f/(1-f)) steps and the run stops exactly when it ends.
-lr_decay_fraction: 0.2
+min_lr: 5e-5
+# Explicit additional phase-2 budget. It is required when starting decay and
+# may be written as 1.2b, 100m, or a plain integer. Decay runs consume exactly
+# the complete optimizer-step prefix represented by this value.
+decay_tokens: null
 max_grad_norm: 1.0
 eval_interval: 200
 eval_batches: 50
@@ -37,14 +48,14 @@ log_interval: 10
 save_interval: null
 # Explicit checkpoint path, or ``latest``/``auto`` for the newest latest.pt.
 resume_from: null
-# ``exact`` keeps the original total budget. ``continue`` resumes an
-# untriggered stable checkpoint and adds ``continue_tokens`` at plateau LR.
+# ``exact`` resumes the saved phase endpoint. ``continue`` adds
+# ``continue_tokens`` at plateau LR and expands the cache when necessary.
 resume_mode: exact
 continue_tokens: null
 seed: 42
 start_context: Every effort moves you
 max_new_tokens: 50
-# Stage-2 flag: on resume, start (or continue) the WSD decay from the resume
-# step instead of keeping the stable plateau. Ignored on fresh runs; a
-# triggered state saved in a checkpoint wins over this flag on resume.
+# Stage-2 flag: on resume, start WSD decay from the saved step using
+# ``decay_tokens``. An active decay checkpoint resumes automatically and its
+# saved endpoint wins over this flag.
 start_decay: false

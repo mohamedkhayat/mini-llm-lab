@@ -15,10 +15,9 @@ def _payload(**overrides):
         scheduler_state={"base_lrs": [5e-4]},
         step=30,
         best_val_loss=1.2,
-        cursor={"epoch": 0, "batch_in_epoch": 5},
         tokens_seen=777,
         run_elapsed_seconds=1.5,
-        steps_per_epoch=40,
+        steps_per_pass=40,
         tokens_per_step=256,
         total_steps=38,
         wandb_run_id="abc123",
@@ -47,38 +46,30 @@ def test_checkpoint_payload_carries_the_untriggered_wsd_state():
     assert payload["wsd"] == {"triggered": False, "step": None}
 
 
-def test_checkpoint_payload_can_carry_native_stream_state():
-    stream_state = {"kind": "dataset", "state": {"source_pass": 0}}
+def test_data_state_capture_and_restore_use_the_loader_seam():
+    class CursorLoader:
+        """The memmap loader's state seam: state_dict / load_state_dict."""
 
-    payload = build_checkpoint_payload(**_payload(data_state=stream_state))
-
-    assert payload["data_state"] == stream_state
-
-
-def test_stream_state_capture_and_restore_use_the_loader_seam():
-    class DatasetState:
         def __init__(self):
-            self.saved = {"position": 3}
+            self.current_step = 0
+
+        def __len__(self):
+            return 5
 
         def state_dict(self):
-            return dict(self.saved)
+            return {"current_step": self.current_step}
 
         def load_state_dict(self, state):
-            self.saved = dict(state)
+            self.current_step = state["current_step"]
 
-    class Loader:
-        stream_stateful = True
-
-        def __init__(self):
-            self.checkpoint_dataset = DatasetState()
-
-    loader = Loader()
+    loader = CursorLoader()
+    loader.current_step = 3
     saved = capture_data_state(loader)
-    loader.checkpoint_dataset.saved = {"position": 0}
+    loader.current_step = 0
     restore_data_state(loader, saved)
 
-    assert saved == {"kind": "dataset", "state": {"position": 3}}
-    assert loader.checkpoint_dataset.saved == {"position": 3}
+    assert saved == {"kind": "memmap", "state": {"current_step": 3}}
+    assert loader.current_step == 3
 
 
 def test_saved_checkpoint_roundtrips_the_wsd_state(tmp_path):
@@ -89,24 +80,21 @@ def test_saved_checkpoint_roundtrips_the_wsd_state(tmp_path):
     assert checkpoint["wsd"] == {"triggered": True, "step": 30}
 
 
-def test_streaming_resume_without_data_state_warns(capsys):
-    class Loader:
-        stream_stateful = True
+def test_memmap_resume_is_silent(capsys):
+    class CursorLoader:
+        current_step = 0
 
-    restore_data_state(Loader(), None)
+        def __len__(self):
+            return 5
 
-    out = capsys.readouterr().out
-    assert "Warning" in out
-    assert "restarts" in out
+        def load_state_dict(self, state):
+            self.current_step = state["current_step"]
 
-
-def test_non_streaming_resume_without_data_state_stays_silent(capsys):
-    class Loader:
-        stream_stateful = False
-
-    restore_data_state(Loader(), None)
+    loader = CursorLoader()
+    restore_data_state(loader, {"kind": "memmap", "state": {"current_step": 4}})
 
     assert capsys.readouterr().out == ""
+    assert loader.current_step == 4
 
 
 def test_legacy_checkpoint_without_wsd_key_is_tolerated_on_resume():

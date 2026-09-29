@@ -3,41 +3,68 @@
 
 The stub skips the config-driven constructor (``Trainer.__new__``) and sets
 the attributes the loop touches: a tiny real model (with a stubbed
-``generate`` call), a real optimizer and scheduler, in-memory dataloaders,
+``generate`` call), a real optimizer and scheduler, real
+``MemmapDataLoader`` instances over a small tokenized ``.bin`` cache,
 a recording logger, and a temp save directory. No GPU, no W&B, no corpora —
-the loop, the checkpoints on disk, and the logger calls are all real.
+the loop, the data stream, the checkpoints on disk, and the logger calls
+are all real.
 """
 
 import json
 
+import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader, Dataset
 
-from data.dataloader import EpochRandomSampler
+from data.dataloader import MemmapDataLoader
 from models.gpt import GptModel
 from training.checkpointing import load_checkpoint
 from training.log_backend import RunLogger
 from training.trainer import Trainer, get_model_parameter_metrics
 
+
+@pytest.fixture(autouse=True)
+def _no_cuda(monkeypatch):
+    """CPU-only test file: never query the shared (possibly memory-starved)
+    GPU for RNG state or timers."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
 VOCAB = 32
 SEQ_LEN = 8
 BATCH_SIZE = 2
-DATASET_SIZE = 16
+BATCH_TOKENS = BATCH_SIZE * SEQ_LEN  # 16 tokens per optimizer step
+# 201 tokens -> (201 - 1) // 16 = 12 batches per data pass.
+TRAIN_TOKENS = 201
+STEPS_PER_PASS = 12
+# Eval file: 49 tokens -> 3 batches (>= eval_batches below).
+EVAL_TOKENS = 49
 
 
-class RangeTokenDataset(Dataset):
-    """In-memory token pairs: sample ``i`` is a short run of token ids."""
+def write_cache(tmp_path):
+    """Write a minimal prepared dataset (train.bin / eval.bin / meta.json).
 
-    def __len__(self):
-        return DATASET_SIZE
-
-    def __getitem__(self, index):
-        tokens = torch.tensor(
-            [(index + k) % VOCAB for k in range(SEQ_LEN)], dtype=torch.long
+    Token ids stay below VOCAB so the stub model can embed them.
+    """
+    data_dir = tmp_path / "cache"
+    data_dir.mkdir()
+    train = (np.arange(TRAIN_TOKENS) % (VOCAB - 1)) + 1
+    eval_tokens = ((np.arange(EVAL_TOKENS) + 13) % (VOCAB - 1)) + 1
+    train.astype(np.uint16).tofile(data_dir / "train.bin")
+    eval_tokens.astype(np.uint16).tofile(data_dir / "eval.bin")
+    with open(data_dir / "meta.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "tokenizer_name": "gpt2",
+                "dtype": "uint16",
+                "max_tokens": TRAIN_TOKENS + EVAL_TOKENS,
+                "train_tokens": TRAIN_TOKENS,
+                "val_tokens": EVAL_TOKENS,
+                "val_ratio": 0.375,
+            },
+            f,
         )
-        return tokens, tokens
+    return data_dir
 
 
 class StubTokenizer:
@@ -118,7 +145,7 @@ class RecordingLogger(RunLogger):
 
 
 class StoppingLoader:
-    """DataLoader wrapper that can trip the stop flag between steps.
+    """MemmapDataLoader wrapper that can trip the stop flag between steps.
 
     Delegates iteration to the wrapped loader; after ``trip_after`` batches
     have been yielded it sets ``stop_requested`` on the trainer, and can
@@ -144,20 +171,22 @@ class StoppingLoader:
         return len(self._loader)
 
     def __getattr__(self, name):
-        # Forward sampler / generator / batch_size and friends to the loader.
+        # Forward state_dict / current_step and friends to the loader.
         return getattr(self._loader, name)
 
 
 def build_stub_trainer(tmp_path, training_overrides=None, **attribute_overrides):
     """Assemble a real, runnable trainer without the config constructor.
 
-    Tiny real model (stubbed ``generate``), real AdamW + LambdaLR, in-memory
-    dataloaders with the epoch sampler, a recording logger, temp save dir.
-    ``training_overrides`` patches the training config section (the loop
-    reads its intervals from there); remaining keyword arguments override
-    plain trainer attributes.
+    Tiny real model (stubbed ``generate``), real AdamW + LambdaLR, real
+    memmap dataloaders over a small tokenized cache, a recording logger,
+    temp save dir. ``training_overrides`` patches the training config
+    section (the loop reads its intervals from there); remaining keyword
+    arguments override plain trainer attributes.
     """
     torch.manual_seed(0)
+
+    data_dir = write_cache(tmp_path)
 
     model_cfg = OmegaConf.create(
         {
@@ -192,12 +221,14 @@ def build_stub_trainer(tmp_path, training_overrides=None, **attribute_overrides)
     training = {
         "seed": 0,
         "device": "cpu",
+        "batch_size": BATCH_SIZE,
+        "accum_steps": 1,
         "lr": 1e-2,
         "min_lr": 1e-3,
         "weight_decay": 0.0,
         "max_grad_norm": 1.0,
         "warmup_fraction": 0.0,
-        "lr_decay_fraction": 0.2,
+        "decay_tokens": None,
         "start_decay": False,
         "log_interval": 2,
         "eval_interval": 4,
@@ -217,20 +248,31 @@ def build_stub_trainer(tmp_path, training_overrides=None, **attribute_overrides)
     cfg = OmegaConf.create(
         {
             "training": training,
-            "data": {"batch_size": BATCH_SIZE, "seq_len": SEQ_LEN},
+            "data": {
+                "seq_len": SEQ_LEN,
+                "tokenizer_name": "gpt2",
+                "hf_dataset": "stub",
+            },
             "model": model_cfg,
         }
     )
 
-    def make_loader():
-        return DataLoader(
-            RangeTokenDataset(),
-            batch_size=BATCH_SIZE,
-            sampler=EpochRandomSampler(RangeTokenDataset(), seed=0),
-        )
+    train_loader = MemmapDataLoader(
+        data_dir, "train", BATCH_SIZE, SEQ_LEN, torch.device("cpu")
+    )
+    val_loader = MemmapDataLoader(
+        data_dir, "eval", BATCH_SIZE, SEQ_LEN, torch.device("cpu")
+    )
+    train_eval_loader = MemmapDataLoader(
+        data_dir, "train", BATCH_SIZE, SEQ_LEN, torch.device("cpu")
+    )
 
-    train_loader = make_loader()
-    val_loader = make_loader()
+    assert len(train_loader) == STEPS_PER_PASS
+
+    # Mirror the real _setup_data accounting: the loaders are built with the
+    # micro-batch geometry; steps_per_pass and tokens_per_step count
+    # optimizer steps over the accumulated micro-batches.
+    accum_steps = int(training["accum_steps"])
 
     trainer = Trainer.__new__(Trainer)
     attributes = {
@@ -240,6 +282,7 @@ def build_stub_trainer(tmp_path, training_overrides=None, **attribute_overrides)
         "tokenizer": StubTokenizer(),
         "train_loader": train_loader,
         "val_loader": val_loader,
+        "train_eval_loader": train_eval_loader,
         "optimizer": torch.optim.AdamW(model.parameters(), lr=1e-2),
         "scheduler": None,  # created below: must wrap the same optimizer
         "criterion": torch.nn.CrossEntropyLoss(),
@@ -253,14 +296,13 @@ def build_stub_trainer(tmp_path, training_overrides=None, **attribute_overrides)
         "logger": RecordingLogger(),
         "step": 0,
         "best_val_loss": float("inf"),
-        "epoch": 0,
-        "batch_in_epoch": 0,
         "tokens_seen": 0,
         "run_elapsed_seconds": 0.0,
         "stop_requested": False,
         "wandb_run_id": None,
-        "steps_per_epoch": len(train_loader),
-        "tokens_per_step": BATCH_SIZE * SEQ_LEN,
+        "accum_steps": accum_steps,
+        "steps_per_pass": max(1, len(train_loader) // accum_steps),
+        "tokens_per_step": BATCH_TOKENS * accum_steps,
         "total_steps": 10,
         "budget_name": "max_steps",
         "wsd_decay": {"triggered": False, "step": None},
@@ -284,10 +326,40 @@ def build_stub_trainer(tmp_path, training_overrides=None, **attribute_overrides)
     return trainer
 
 
+def test_build_scheduler_rejects_checkpoints_missing_scheduler_or_optimizer_state(
+    tmp_path,
+):
+    # Resume requires the full optimizer/scheduler state; checkpoints from
+    # the old trainers are not resumable.
+    trainer = build_stub_trainer(tmp_path, continuation_run=False)
+    trainer.resume_checkpoint = {
+        "scheduler": None,
+        "optimizer": trainer.optimizer.state_dict(),
+    }
+    with pytest.raises(ValueError, match="scheduler"):
+        trainer._build_scheduler()
+
+    trainer.resume_checkpoint = {
+        "scheduler": trainer.scheduler.state_dict(),
+        "optimizer": None,
+    }
+    with pytest.raises(ValueError, match="optimizer"):
+        trainer._build_scheduler()
+
+    # A complete state restores in the load-bearing order (scheduler first,
+    # so the checkpoint's exact current LR wins).
+    trainer.resume_checkpoint = {
+        "scheduler": trainer.scheduler.state_dict(),
+        "optimizer": trainer.optimizer.state_dict(),
+    }
+    trainer._build_scheduler()
+
+
 def test_budget_stop_writes_final_and_latest_checkpoints(tmp_path):
     """A run that hits its step budget ends cleanly at exactly the total
     steps: final + latest checkpoints on disk, closing run metrics with
-    progress 1.0, and the run finished."""
+    progress 1.0, and the run finished. The budget (10 steps) fits in the
+    file's 12-step capacity (single pass)."""
     trainer = build_stub_trainer(
         tmp_path, training_overrides={"eval_interval": 999}, total_steps=10
     )
@@ -351,7 +423,9 @@ def test_keyboard_interrupt_from_the_data_iterator_takes_the_graceful_path(tmp_p
 def test_best_checkpoint_written_only_on_improvement_and_rewritten_later(tmp_path):
     """Each evaluation saves best.pt only when the val loss improves, and a
     later improvement rewrites it: the file on disk carries the lowest val
-    loss seen, and exactly one best save happened per improvement."""
+    loss seen, and exactly one best save happened per improvement. The
+    evaluations also exercise the new train-loss shadow loader and the
+    deterministic eval split."""
     trainer = build_stub_trainer(tmp_path, total_steps=12)
 
     trainer.train()
@@ -379,7 +453,8 @@ def test_best_checkpoint_written_only_on_improvement_and_rewritten_later(tmp_pat
 
 def test_save_interval_writes_periodic_step_checkpoints_and_latest(tmp_path):
     """At each save interval the loop writes a periodic step checkpoint and
-    refreshes latest.pt (plus the final pair at completion)."""
+    refreshes latest.pt (plus the final pair at completion). The periodic
+    checkpoint carries the memmap data cursor."""
     trainer = build_stub_trainer(
         tmp_path,
         training_overrides={"eval_interval": 999, "save_interval": 4},
@@ -406,41 +481,69 @@ def test_save_interval_writes_periodic_step_checkpoints_and_latest(tmp_path):
 
     saved_step_4 = load_checkpoint(tmp_path / "step_4.pt")
     assert saved_step_4["step"] == 4
-    assert saved_step_4["cursor"] == {"epoch": 0, "batch_in_epoch": 4}
+    assert saved_step_4["steps_per_pass"] == trainer.steps_per_pass
+    assert saved_step_4["data_state"] == {
+        "kind": "memmap",
+        "state": {"current_step": 4},
+    }
+    # Single pass: 8 steps = 8 batches, so the data cursor sits at
+    # batch 8 — always step * accum_steps (accum=1 today).
+    saved_final = load_checkpoint(tmp_path / "final_model.pt")
+    assert saved_final["data_state"] == {
+        "kind": "memmap",
+        "state": {"current_step": 8},
+    }
 
 
-def test_resume_cursor_skips_consumed_batches_and_advances_the_epoch(tmp_path):
-    """A resumed run starts mid-pass: already-consumed batches are skipped,
-    the sampler's epoch setter is called for each logical data pass, and a
-    full pass advances the epoch cursor."""
+def test_resume_starts_from_the_saved_batch_position(tmp_path):
+    """A resumed run continues from the loader's saved position (not from
+    the top of the file) and runs to the budget without rescan: with the
+    cursor at batch 3 and a budget of 12, the run consumes batches 3..11
+    and ends exactly at the file's end."""
     trainer = build_stub_trainer(
         tmp_path,
         training_overrides={"eval_interval": 999},
-        total_steps=13,
-        step=3,
-        epoch=0,
-        batch_in_epoch=3,
-        tokens_seen=3 * BATCH_SIZE * SEQ_LEN,
+        total_steps=12,
     )
-
-    # Record the sampler's epoch setter calls across the whole run.
-    sampler = trainer.train_loader.sampler
-    epoch_calls = []
-    original_set_epoch = sampler.set_epoch
-
-    def recording_set_epoch(epoch):
-        epoch_calls.append(epoch)
-        original_set_epoch(epoch)
-
-    sampler.set_epoch = recording_set_epoch
+    trainer.step = 3
+    trainer.tokens_seen = 3 * BATCH_TOKENS
+    trainer.train_loader.load_state_dict({"current_step": 3})
 
     trainer.train()
 
-    # Pass 1 (resumed): only batches 3..7 consumed -> 5 steps; pass 2: the
-    # budget runs out after 5 more steps, so the cursor points at batch 5.
-    assert trainer.step == 13
-    assert trainer.epoch == 1
-    assert trainer.batch_in_epoch == 5
-    assert trainer.tokens_seen == 13 * trainer.tokens_per_step
-    assert epoch_calls == [0, 1]
-    assert (tmp_path / "final_model.pt").is_file()
+    assert trainer.step == 12
+    assert trainer.tokens_seen == 12 * BATCH_TOKENS
+    assert trainer.train_loader.current_step == 12
+
+
+def test_gradient_accumulation_steps_once_per_micro_batch_group(tmp_path):
+    """With accum_steps=2 each optimizer step consumes 2 micro-batches:
+    the loader cursor advances in micro-batch units, tokens count the
+    effective batch (batch_size x seq_len x accum_steps), and the loss
+    line appears once per optimizer step."""
+    trainer = build_stub_trainer(
+        tmp_path,
+        training_overrides={"accum_steps": 2, "log_interval": 1},
+        total_steps=4,
+    )
+
+    trainer.train()
+
+    assert trainer.step == 4
+    assert trainer.tokens_seen == 4 * 2 * BATCH_TOKENS
+    assert trainer.train_loader.current_step == 8
+    assert len(trainer.logger.logged("train/loss")) == 4
+
+
+def test_budget_larger_than_one_pass_is_rejected(tmp_path):
+    """The trainer does not rescan the data: a budget beyond the file's
+    capacity raises before any step, pointing at data.max_tokens."""
+    trainer = build_stub_trainer(tmp_path, total_steps=13)
+
+    with pytest.raises(ValueError, match="data.max_tokens"):
+        trainer.train()
+
+    assert trainer.step == 0
+    assert trainer.tokens_seen == 0
+    assert trainer.train_loader.current_step == 0
+    assert not (tmp_path / "final_model.pt").exists()

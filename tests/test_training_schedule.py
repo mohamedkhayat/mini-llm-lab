@@ -7,9 +7,9 @@ from training.log_backend import resolve_log_backend
 from training.trainer import Trainer
 from training.schedule import (
     build_lr_lambda,
+    resolve_phase_budget,
     resolve_continuation_steps,
     resolve_decay_budget,
-    resolve_total_steps,
 )
 
 
@@ -30,33 +30,26 @@ def test_unknown_log_backend_is_rejected():
         resolve_log_backend(SimpleNamespace(log_backend="tensorboard"))
 
 
-def test_token_budget_is_converted_to_complete_optimizer_steps():
-    cfg = SimpleNamespace(max_steps=None, max_tokens=1000, epochs=10)
-
-    total_steps, budget_name = resolve_total_steps(
-        cfg, steps_per_epoch=20, tokens_per_step=32
+def test_exact_budget_is_one_pass_over_the_data_file():
+    # With no explicit phase budget, the run still defaults to one pass over
+    # the prepared train cache.
+    trainer = Trainer.__new__(Trainer)
+    trainer.cfg = SimpleNamespace(
+        training=SimpleNamespace(
+            resume_mode="exact",
+            continue_tokens=None,
+            start_decay=False,
+        )
     )
+    trainer.resume_checkpoint = None
+    trainer.steps_per_pass = 42
+    trainer.tokens_per_step = 32
 
-    assert total_steps == 31
-    assert budget_name == "max_tokens"
+    trainer._resolve_budget()
 
-
-def test_step_budget_takes_the_place_of_epoch_budget():
-    cfg = SimpleNamespace(max_steps=75, max_tokens=None, epochs=10)
-
-    total_steps, budget_name = resolve_total_steps(
-        cfg, steps_per_epoch=20, tokens_per_step=32
-    )
-
-    assert total_steps == 75
-    assert budget_name == "max_steps"
-
-
-def test_step_and_token_budgets_cannot_both_be_set():
-    cfg = SimpleNamespace(max_steps=75, max_tokens=1000, epochs=10)
-
-    with pytest.raises(ValueError, match="only one"):
-        resolve_total_steps(cfg, steps_per_epoch=20, tokens_per_step=32)
+    assert trainer.total_steps == 42
+    assert trainer.budget_name == "one_pass"
+    assert trainer.total_train_tokens == 42 * 32
 
 
 def test_stable_continuation_uses_additional_complete_optimizer_steps():
@@ -72,6 +65,156 @@ def test_stable_continuation_requires_a_complete_optimizer_step():
         resolve_continuation_steps(cfg, tokens_per_step=32)
 
 
+def test_manual_decay_uses_an_explicit_additional_token_budget():
+    cfg = SimpleNamespace(
+        resume_mode="exact",
+        start_decay=True,
+        decay_tokens="1k",
+    )
+
+    budget = resolve_phase_budget(
+        cfg,
+        {"step": 10, "total_steps": 10, "wsd": {"triggered": False}},
+        tokens_per_step=64,
+    )
+
+    assert budget.mode == "decay_tokens"
+    assert budget.stage == "decay"
+    assert budget.start_step == 10
+    assert budget.target_step == 25
+    assert budget.requested_tokens == 1_000
+    assert budget.effective_tokens == 960
+    assert budget.decay_steps == 15
+
+
+def test_active_decay_checkpoint_wins_over_a_new_decay_request():
+    cfg = SimpleNamespace(
+        resume_mode="exact",
+        start_decay=True,
+        decay_tokens="99k",
+    )
+    checkpoint = {
+        "step": 17,
+        "total_steps": 40,
+        "wsd": {
+            "mode": "decay_tokens",
+            "stage": "decay",
+            "start_step": 12,
+            "target_step": 40,
+            "requested_tokens": 1_792,
+            "effective_tokens": 1_792,
+            "decay_start_step": 12,
+            "decay_steps": 28,
+        },
+    }
+
+    budget = resolve_phase_budget(cfg, checkpoint, tokens_per_step=64)
+
+    assert budget.target_step == 40
+    assert budget.decay_start_step == 12
+    assert budget.decay_steps == 28
+    assert budget.requested_tokens == 1_792
+
+
+def test_manual_decay_overrides_a_saved_stable_endpoint():
+    cfg = SimpleNamespace(
+        resume_mode="exact",
+        start_decay=True,
+        decay_tokens="1k",
+    )
+    checkpoint = {
+        "step": 12,
+        "total_steps": 20,
+        "wsd": {
+            "mode": "train_tokens",
+            "stage": "stable",
+            "start_step": 0,
+            "target_step": 20,
+            "requested_tokens": 1_280,
+            "effective_tokens": 1_280,
+            "decay_start_step": None,
+            "decay_steps": None,
+        },
+    }
+
+    budget = resolve_phase_budget(cfg, checkpoint, tokens_per_step=64)
+
+    assert budget.mode == "decay_tokens"
+    assert budget.start_step == 12
+    assert budget.target_step == 27
+    assert budget.decay_steps == 15
+
+
+def test_completed_decay_can_start_a_new_explicit_decay_budget():
+    cfg = SimpleNamespace(
+        resume_mode="exact",
+        start_decay=True,
+        decay_tokens="1k",
+    )
+    checkpoint = {
+        "step": 25,
+        "total_steps": 25,
+        "wsd": {
+            "mode": "decay_tokens",
+            "stage": "decay",
+            "start_step": 10,
+            "target_step": 25,
+            "requested_tokens": 960,
+            "effective_tokens": 960,
+            "decay_start_step": 10,
+            "decay_steps": 15,
+        },
+    }
+
+    budget = resolve_phase_budget(cfg, checkpoint, tokens_per_step=64)
+
+    assert budget.start_step == 25
+    assert budget.target_step == 40
+    assert budget.decay_start_step == 25
+
+
+def test_stable_continuation_budget_is_additive_and_suffix_aware():
+    cfg = SimpleNamespace(
+        resume_mode="continue",
+        start_decay=False,
+        continue_tokens="1k",
+    )
+
+    budget = resolve_phase_budget(cfg, {"step": 10}, tokens_per_step=64)
+
+    assert budget.mode == "stable_continue"
+    assert budget.target_step == 25
+    assert budget.effective_tokens == 960
+
+
+def test_fresh_train_tokens_define_the_stable_endpoint():
+    cfg = SimpleNamespace(
+        resume_mode="exact",
+        start_decay=False,
+        train_tokens="1k",
+    )
+
+    budget = resolve_phase_budget(cfg, None, tokens_per_step=64)
+
+    assert budget.mode == "train_tokens"
+    assert budget.target_step == 15
+    assert budget.effective_tokens == 960
+
+
+def test_legacy_triggered_checkpoint_keeps_its_saved_endpoint():
+    cfg = SimpleNamespace(resume_mode="exact", start_decay=False)
+
+    budget = resolve_phase_budget(
+        cfg,
+        {"step": 30, "total_steps": 38, "wsd": {"triggered": True, "step": 30}},
+        tokens_per_step=64,
+    )
+
+    assert budget.mode == "legacy_decay"
+    assert budget.target_step == 38
+    assert budget.decay_steps == 8
+
+
 def test_trainer_stable_continuation_extends_the_saved_step_budget():
     trainer = Trainer.__new__(Trainer)
     trainer.cfg = SimpleNamespace(
@@ -80,17 +223,17 @@ def test_trainer_stable_continuation_extends_the_saved_step_budget():
             continue_tokens=96,
             max_steps=None,
             max_tokens=None,
-            epochs=1,
             start_decay=False,
         )
     )
     trainer.resume_checkpoint = {
         "step": 7,
         "total_steps": 7,
-        "steps_per_epoch": 2,
+        "steps_per_pass": 2,
+        "tokens_per_step": 32,
         "wsd": {"triggered": False, "step": None},
     }
-    trainer.steps_per_epoch = 2
+    trainer.steps_per_pass = 2
     trainer.tokens_per_step = 32
 
     trainer._resolve_budget()

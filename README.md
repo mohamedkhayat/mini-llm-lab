@@ -14,8 +14,8 @@ system or a package of pretrained models.
 - Local text-file and Hugging Face dataset inputs, plus memory-mapped token
   caches for large corpora
 - GPT-2 tokenization through `tiktoken`
-- Deterministic train/validation splitting with epoch-deterministic sampling
-  for exact resume
+- Hugging Face dataset tokenization into a local, resumable token cache
+  (`train.bin` / `eval.bin`), scanned sequentially by a memmap dataloader
 - Causal attention backends: multi-head, fast SDPA, and grouped-query attention
 - Configurable feed-forward: activation by name and optional gated
   SwiGLU-style projections
@@ -63,21 +63,16 @@ system, then install this project.
 
 ## Run training
 
-The default data config uses the small *The Verdict* corpus at
-`data/the_verdict`. If it is missing, the loader downloads it automatically.
-For a larger local corpus, put UTF-8 text files under `data/` and override the
-`data.files` setting.
+Training runs from a Hugging Face dataset. Before training, `train.py`
+tokenizes `data.hf_dataset` into a local cache at
+`data/<dataset>/<tokenizer_name>/` (`train.bin`, `eval.bin`, `meta.json`) —
+see "Data preparation" below; an existing valid cache is reused.
 
-```text
-data/
-├── book-one.txt
-└── book-two.txt
-```
-
-Select those files with a Hydra override:
+The default dataset is set in `configs/data/default.yaml`. Point a run at any
+Hugging Face dataset (parquet) with a Hydra override:
 
 ```bash
-python train.py 'data.files=[data/book-one.txt,data/book-two.txt]'
+python train.py data.hf_dataset=Salesforce/wikitext data.hf_config=wikitext-2-raw-v1
 ```
 
 For a normal GPU run:
@@ -86,8 +81,8 @@ For a normal GPU run:
 python train.py
 ```
 
-The trainer tokenizes the corpus, splits it 90/10, creates overlapping
-next-token windows, and trains the GPT-style model. W&B logs online by default;
+The trainer scans the tokenized files with the memmap dataloader and trains
+the GPT-style model. W&B logs online by default;
 use `WANDB_MODE=offline` for local logging or `WANDB_MODE=disabled` to skip W&B.
 You can choose terminal logging directly with `training.log_backend=terminal`.
 In terminal mode, training/evaluation losses and generated sample text are
@@ -100,22 +95,19 @@ python train.py training.log_backend=terminal
 The default is `training.log_backend=wandb`; `WANDB_MODE=disabled` switches to
 terminal logging automatically.
 
-Training budgets can be expressed directly in optimizer steps or tokens. A
-token budget is rounded down to complete batches, and the dataloader is cycled
-when the budget spans multiple passes through the data. `epochs` remains as a
-backwards-compatible fallback when neither budget is set:
+`data.max_tokens` is the preprocessing/cache budget: total tokens written to
+the train and validation files. The current phase budget is separate:
+`training.train_tokens` selects a fresh stable prefix,
+`training.continue_tokens` adds stable tokens on resume, and
+`training.decay_tokens` adds decay tokens after the manual phase-2 trigger.
+Budgets accept plain integers or decimal suffixes such as `1.2b` and `100m`.
+If a phase endpoint exceeds the cache's train side, the launcher reprocesses a
+larger cache while preserving the existing token prefix.
 
-```bash
-python train.py training.max_tokens=100000000
-python train.py training.max_steps=10000
-```
-
-The default learning-rate schedule is WSD (see **Two-stage WSD training**
-below): a linear warmup over `training.warmup_fraction` of the budget, a flat
-plateau at `training.lr`, and a final cosine decay to `training.min_lr`
-whose length is `training.lr_decay_fraction` of the whole run.
-`training.max_steps` and `training.max_tokens` are mutually
-exclusive.
+The default learning-rate schedule is manual WSD (see **Two-stage WSD
+training** below): a linear warmup, a flat plateau at `training.lr`, and a
+manual cosine decay to `training.min_lr` over the explicit phase-2 token
+budget.
 
 ### `train.py` command reference
 
@@ -130,7 +122,7 @@ The main config groups are:
 
 | Override | Choices | Default | Selects |
 | --- | --- | --- | --- |
-| `data=...` | `default`, `hf_dataset`, `gutenberg` | `default` | Corpus source and dataloader settings |
+| `data=...` | `default` | `default` | Hugging Face dataset, tokenizer, and tokenized cache |
 | `model=...` | `gpt2`, `qwen`, `moe` | `gpt2` | Model configuration file |
 | `training=...` | `default` | `default` | Optimizer, schedule, logging, and run settings |
 
@@ -156,32 +148,24 @@ parameter is only present in another preset.
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `data.source` | `files` | Input type: `files` for local text/glob patterns or `hf_dataset` for a Hugging Face dataset. If `data.tokenized_dir` is set, the token cache takes precedence. |
-| `data.files` | `[data/the_verdict]` | Local UTF-8 files or glob patterns. Relative paths are resolved from the directory where `train.py` was launched, not Hydra's run directory. If no file matches, the small *The Verdict* sample is downloaded as a fallback. |
-| `data.max_files` | `null` | Maximum number of raw files to read, after sorted glob expansion. Useful for limiting the Gutenberg preset. Ignored when using a tokenized cache. |
-| `data.tokenized_dir` | `null` | Directory containing `manifest.json` and binary token shards created by `python -m data.token_shards`. The cache must use the same tokenizer as `data.tokenizer_name`. |
-| `data.hf_dataset` | `null` | Hugging Face dataset repository name, for example `Salesforce/wikitext`. Used when `data.source=hf_dataset`. |
-| `data.hf_config` | `null` | Optional dataset configuration or subset, for example `wikitext-2-raw-v1`. |
-| `data.text_column` | `text` | Field read from each Hugging Face example. List-valued fields are joined with spaces. |
-| `data.split` | `train` | Hugging Face dataset split to load. This is the source split; the trainer still creates its own train/validation split from the resulting token stream. |
-| `data.streaming` | `false` | Ask `datasets` for a native `IterableDataset`. Streaming packs consecutive source rows (each EOS-terminated) into a rolling token buffer and cuts windows from the packed stream, so short rows still contribute tokens. It never materializes the corpus or creates project-owned HF shards. |
-| `data.tokenizer_name` | `gpt2` | `tiktoken` encoding name. The model's `vocab_size` must be compatible with the selected tokenizer. |
-| `data.seq_len` | `256` | Number of input tokens in each training example. Each target is the same window shifted one token to the right. Must not exceed `model.context_length`. |
-| `data.stride` | `128` | Distance between the starts of consecutive windows. `seq_len` gives adjacent windows; smaller values increase overlap. Must be positive. |
-| `data.batch_size` | `2` | Number of windows per optimizer step. The effective tokens per step are `batch_size * seq_len`. |
-| `data.val_ratio` | `0.1` | Validation fraction. In the regular loader this is a positional token split; in HF streaming mode it deterministically assigns source rows to train/validation because the total token count is unknown without consuming the stream. Packing happens within each split, so validation windows never contain training tokens. |
-| `data.shuffle` | `true` | Shuffle training windows with the deterministic local sampler, or HF's native `IterableDataset.shuffle()` in streaming mode. Validation windows are never shuffled. |
-| `data.shuffle_buffer_size` | `10000` | Native HF streaming shuffle-buffer size. It is an in-memory example buffer, not a token shard; HF also owns source-shard ordering and epoch reseeding. |
-| `data.drop_last` | `true` | Drop an incomplete training batch. Set `false` to retain it, but the effective token count per step then varies for the final batch of a data pass. |
-| `data.num_workers` | `4` (file loaders) / `0` (streaming) | PyTorch dataloader worker processes for the file/token-cache loaders. HF streaming is single-process and must run with `0`: forked workers import `datasets` inside the child process, which breaks wandb's import hooks. Rows are tokenized on the main thread. |
-| `data.pin_memory` | `true` | Pin host batches for faster CPU-to-CUDA transfers when training on a GPU. |
-| `data.persistent_workers` | `true` | Keep dataloader workers alive between passes. It is automatically disabled when `data.num_workers=0`. |
-| `data.seed` | `42` | Seed used for dataloader generators and deterministic training-window order. `training.seed` controls the model and global random streams. |
+| `data.hf_dataset` | `HuggingFaceFW/finepdfs_edu_50BT-dclm_30BT-fineweb_edu_20BT-shuffled` | Hugging Face dataset repository name (parquet). `train.py` tokenizes it into `data/<dataset>/<tokenizer_name>/` when that cache is missing or stale. |
+| `data.hf_config` | `null` | Optional dataset configuration or subset. |
+| `data.revision` | `null` | Optional immutable Hugging Face revision. Cache expansion reuses the revision recorded in `meta.json` when this is null. |
+| `data.text_column` | `text` | Field read from each Hugging Face example during preparation. |
+| `data.file_format` | `parquet` | File format of the downloaded dataset, passed to the preparation step. |
+| `data.tokenizer_name` | `gpt2` | `tiktoken` encoding name used for the tokenized cache. The model's `vocab_size` must be compatible with the selected tokenizer. |
+| `data.max_tokens` | `6000000000` | Total tokens the preparation step caches (train + eval, split by `data.val_ratio`). It may be written as `6b`; the launcher expands it automatically when a requested phase endpoint needs more train capacity. |
+| `data.seq_len` | `1024` | Number of input tokens in each training example. Each target is the same window shifted one token to the right. Must not exceed `model.context_length`. |
+| `data.val_ratio` | `0.1` | Validation fraction of the tokenized cache. The split is positional at preparation time, so validation windows never contain training tokens. |
 
-Preset-specific data defaults are `seq_len=1024`, `stride=512`, and
-`batch_size=4` for both `data=hf_dataset` and `data=gutenberg`. The Gutenberg
-preset additionally defaults to `data.max_files=200`; use a token cache for
-the full corpus.
+The data stream is a sequential scan. The cache metadata must agree with
+`data.max_tokens` and `data.val_ratio`; the train split contains the
+`floor((1 - val_ratio) * max_tokens)` prefix and the remainder is validation.
+Phase budgets are rounded down to complete optimizer steps. Evaluation reads the first
+`training.eval_batches` micro-batches of
+`eval.bin` (deterministic) plus the same number of micro-batches from the
+start of `train.bin` through a shadow loader, so evaluations never consume or
+rewind the training stream.
 
 #### Training parameters (`training.*`)
 
@@ -195,32 +179,32 @@ the full corpus.
 | `training.use_tensor_cores` | `false` | Enable TF32 matmuls for eligible CUDA devices (compute capability 8.0+). This trades some numerical precision for throughput. |
 | `training.log_backend` | `wandb` | `wandb` logs metrics and samples to Weights & Biases; `terminal` prints samples and evaluation summaries locally. `term` and `console` are aliases for `terminal`. |
 | `training.upload_artifacts` | `false` | Upload full checkpoint files to W&B as artifacts when `training.log_backend=wandb`. Local checkpoints are always written; enable this only when remote checkpoint copies are wanted. |
-| `training.max_steps` | `null` | Explicit optimizer-step budget. Takes precedence over `epochs`; it cannot be set together with `training.max_tokens`. |
-| `training.max_tokens` | `null` | Explicit token budget. It is converted to complete optimizer steps using `data.batch_size * data.seq_len`, rounded down, and cannot be set together with `training.max_steps`. |
-| `training.epochs` | `10` | Backwards-compatible fallback when neither `max_steps` nor `max_tokens` is set. One epoch means one complete pass through the training dataloader. |
 | `training.lr` | `5e-4` | AdamW peak learning rate. |
 | `training.weight_decay` | `0.1` | AdamW weight decay. |
+| `training.batch_size` | `8` | Micro-batch: windows per data pull and per forward/backward pass. The loader geometry — the tokenized cache and resume cursor are in micro-batch units. |
+| `training.accum_steps` | `8` | Micro-batches per optimizer step (gradient accumulation): gradients are summed over the group, then one optimizer + LR step is taken. The effective batch is `batch_size * accum_steps`; the token counter and the data-pass capacity count effective batches. Must be positive. |
+| `training.train_tokens` | `null` | Fresh phase-1 stable budget. It may be an integer or a suffix value such as `1.2b`; null uses the available cached train capacity. |
 | `training.warmup_fraction` | `0.1` | Fraction of the stage-1 budget used for the linear learning-rate warmup. Decay runs (stage 2, `start_decay=true`) skip warmup because it already happened in stage 1. |
 | `training.min_lr` | `1e-5` | Learning-rate floor reached at the end of the WSD decay. It must be positive and no greater than `training.lr`. |
-| `training.lr_decay_fraction` | `0.2` | Fraction of the final run occupied by the decay, in `(0, 1)`. In a two-stage run that starts decaying at resume step `S`, the decay lasts `D = round(S · f / (1 − f))` steps and the run stops exactly when the decay ends. |
+| `training.decay_tokens` | `null` | Additional phase-2 decay budget, required with `training.start_decay=true`. It may be an integer or a suffix value such as `1b`; the cosine decay ends after its complete optimizer-step prefix. |
 | `training.max_grad_norm` | `1.0` | Maximum gradient norm for global gradient clipping. |
 | `training.eval_interval` | `200` | Run evaluation and generate a sample every this many optimizer steps. The best validation checkpoint is updated when validation loss improves. |
 | `training.eval_batches` | `50` | Maximum number of training and validation batches used for each evaluation. Set it lower for quick experiments; evaluation uses model-eval mode. |
 | `training.log_interval` | `10` | Print and log training loss, learning rate, throughput, and progress every this many optimizer steps. |
 | `training.save_interval` | `null` | Optional periodic restart interval in optimizer steps. It writes both `step_<N>.pt` and an updated `latest.pt`. |
 | `training.resume_from` | `null` | Checkpoint path to resume, relative to the launch directory, or `latest`/`auto` to select the newest `latest.pt` below the project. |
-| `training.resume_mode` | `exact` | `exact` preserves the original total budget; `continue` adds `training.continue_tokens` to an untriggered stable checkpoint at constant LR. |
-| `training.continue_tokens` | `null` | Additional token budget for `resume_mode=continue`, rounded down to complete optimizer batches. Do not combine it with `max_steps`, `max_tokens`, or `start_decay`. |
-| `training.start_decay` | `false` | Stage-2 flag: on resume, start (or continue) the WSD decay from the resume step instead of keeping the stable plateau. Ignored on fresh runs. |
+| `training.resume_mode` | `exact` | `exact` resumes the saved phase endpoint; `continue` adds `training.continue_tokens` to an untriggered stable checkpoint at constant LR and expands the cache when necessary. |
+| `training.continue_tokens` | `null` | Additional stable-phase budget for `resume_mode=continue`, rounded down to complete optimizer batches. An interrupted continuation resumes its saved endpoint without adding the value twice. |
+| `training.start_decay` | `false` | On a stable checkpoint, manually start phase-2 decay using `training.decay_tokens`. An active decay checkpoint resumes automatically; this flag cannot restart it. |
 | `training.seed` | `42` | Global Python, NumPy, PyTorch, and CUDA seed. It is also stored in checkpoints for reproducible continuation. |
 | `training.start_context` | `Every effort moves you` | Prompt used when generating the periodic text sample. |
 | `training.max_new_tokens` | `50` | Maximum number of tokens appended to `start_context` for each sample. |
 
 The learning-rate schedule is WSD (warmup → stable → decay): a linear warmup,
-a flat plateau at `lr`, and a final cosine decay to `min_lr` that is
+a flat plateau at `lr`, and a manual cosine decay to `min_lr` that is
 triggered by a stage-2 run (see **Two-stage WSD training** below). A single
 run that never triggers the decay trains warmup plus the stable plateau for
-the whole chosen budget.
+its selected phase-1 budget.
 
 #### Model parameters (`model.*`)
 
@@ -280,111 +264,66 @@ useful ones are:
 Quote list overrides so the shell does not reinterpret them:
 
 ```bash
-python train.py 'data.files=[data/book-one.txt,data/book-two.txt]'
-python train.py -m training.lr=1e-4,5e-4 training.max_steps=1000
+python train.py -m training.lr=1e-4,5e-4
 ```
 
-Do not set both `training.max_steps` and `training.max_tokens`. For an exact
-resume, keep the original data source, tokenizer, model architecture, batch
-size, sequence length, stride, `drop_last` setting, and total budget unchanged.
+For an exact resume, keep the original data source, tokenizer, model
+architecture, `training.batch_size`, `training.accum_steps`, `data.seq_len`,
+and `data.max_tokens` unchanged.
 
-For a quick CPU smoke test, reduce the model and data sizes:
+For a quick CPU smoke test without downloading a dataset, write a tiny fake
+tokenized cache (the trainer skips preparation when the cache is valid) and
+reduce the model and data sizes:
 
 ```bash
-WANDB_MODE=disabled python train.py \
+python - <<'EOF'
+import json
+import numpy as np
+from pathlib import Path
+
+d = Path("data/smoke/gpt2")
+d.mkdir(parents=True, exist_ok=True)
+np.zeros(6336, dtype=np.uint16).tofile(d / "train.bin")
+np.ones(704, dtype=np.uint16).tofile(d / "eval.bin")
+(d / "meta.json").write_text(
+    json.dumps(
+        {"tokenizer_name": "gpt2", "hf_dataset": "smoke", "hf_config": None,
+         "text_column": "text", "file_format": "parquet", "dtype": "uint16",
+         "max_tokens": 7040, "train_tokens": 6336, "val_tokens": 704,
+         "val_ratio": 0.1}
+    )
+)
+EOF
+WANDB_MODE=disabled CUDA_VISIBLE_DEVICES="" python train.py \
+  data.hf_dataset=smoke data.max_tokens=7040 \
   model.emb_dim=128 model.n_heads=4 model.n_layers=2 model.context_length=128 \
-  data.seq_len=128 data.stride=64 data.batch_size=2 data.num_workers=0 \
-  training.device=cpu training.max_steps=20 training.eval_interval=20 \
+  data.seq_len=128 training.batch_size=2 training.accum_steps=1 \
+  training.device=cpu training.eval_interval=20 \
   training.eval_batches=2 training.max_new_tokens=2
 ```
 
-The sample corpus is intentionally small, so use a reduced sequence length.
-Training data files and generated experiment outputs are local-only and ignored
+The run trains the whole one-pass budget (24 optimizer steps on this cache)
+and writes `final_model.pt` at the end.
+
+The fake corpus is intentionally small; keep the reduced sequence length.
+Tokenized caches and generated experiment outputs are local-only and ignored
 by Git.
 
-### Use a Hugging Face dataset
+### Data preparation
 
-The included preset loads WikiText-2:
+`train.py` tokenizes `data.hf_dataset` before training: it downloads the
+dataset, encodes it with `data.tokenizer_name`, appends an end-of-text token
+after every example, and writes the first `data.max_tokens` tokens to
+`data/<dataset>/<tokenizer_name>/` — `train.bin`, `eval.bin` (the
+`data.val_ratio` split), and a `meta.json` recording the dataset identity,
+tokenizer, split counts, validation ratio, and storage dtype (`uint16` when the
+vocabulary fits, else `uint32`). The cache is reused only when those identity,
+metadata, and file-size invariants satisfy the run; a missing, stale, or
+undersized cache is re-prepared.
 
-```bash
-python train.py data=hf_dataset data.hf_config=wikitext-2-raw-v1
-```
-
-For a dataset too large to materialize locally, enable native streaming and
-use an explicit step/token budget. Streaming always runs in the main process
-(`data.num_workers` must be `0`):
-
-```bash
-python train.py data=hf_dataset data.streaming=true \
-  training.max_tokens=100000000
-```
-
-Any compatible dataset can be selected with Hydra overrides. Its examples must
-contain the configured text column:
-
-```bash
-python train.py \
-  data=hf_dataset \
-  data.hf_dataset=Salesforce/wikitext \
-  data.hf_config=wikitext-2-raw-v1 \
-  data.text_column=text
-```
-
-Dataset downloads require internet access. With `data.streaming=true`, Hugging
-Face progressively reads the source while training. Consecutive rows are packed
-into a rolling token buffer (EOS-separated, the same idiom as the file token
-cache in `data.token_shards`), so short rows contribute windows instead of
-being dropped. The project keeps only the sub-window buffer remainder (fewer
-than `seq_len + stride` tokens) in memory and stores HF's native source state
-plus that buffer in checkpoints. The train stream uses one long-lived
-iterator per source pass, so HF's shuffle buffer is refilled only on pass
-boundaries and on checkpoint restore — at most `data.shuffle_buffer_size`
-rows are skipped there, never re-read. Exact source order after a shuffled
-resume is not guaranteed: HF refills its shuffle buffer rather than
-checkpointing the buffer contents.
-
-For the Project Gutenberg preset, cap the number of books while experimenting:
-
-```bash
-python train.py data=gutenberg data.max_files=10 data.num_workers=0
-```
-
-### Train from the full Gutenberg corpus
-
-The raw-file loader concatenates its inputs in memory and is intended for
-small experiments. For the full Gutenberg corpus, first build a reusable,
-memory-mappable token cache. The builder reads one book at a time and writes
-binary token shards; it does not create a large in-memory token tensor:
-
-```bash
-python -m data.token_shards \
-  --input data/gutenberg/data/text \
-  --output data/gutenberg/tokenized \
-  --tokenizer gpt2 \
-  --shard-tokens 256000000 \
-  --workers 8
-```
-
-Workers tokenize different books in parallel; the parent process alone writes
-the shards, so the output remains deterministic. Choose `--workers` according
-to the available CPU cores and storage bandwidth.
-
-Then point training at that cache. The loader keeps random window shuffling,
-but maps token shards from disk and only materializes each batch:
-
-```bash
-python train.py \
-  data=gutenberg \
-  data.tokenized_dir=data/gutenberg/tokenized \
-  data.seq_len=2048 \
-  data.stride=2048 \
-  data.batch_size=8 \
-  training.max_tokens=3200000000
-```
-
-The manifest stores the tokenizer, vocabulary, split counts, source files,
-and shard sizes. Do not use `data.max_files` when training from a complete
-cache; the cache already defines the corpus.
+The trainer scans the files sequentially through `np.memmap` (one data pass
+is one scan of `train.bin`), so neither preparation nor training materializes
+the corpus in memory.
 
 ## Configuration
 
@@ -392,14 +331,14 @@ Hydra composes the defaults in `configs/config.yaml` from three groups:
 
 | Group | Default | Alternatives | Purpose |
 | --- | --- | --- | --- |
-| `data` | `default` | `hf_dataset`, `gutenberg` | Corpus, tokenizer, windows, and loaders |
+| `data` | `default` | — | Hugging Face dataset, tokenizer, and tokenized cache |
 | `model` | `gpt2` | `qwen`, `moe` | Model dimensions and planned architecture variants |
 | `training` | `default` | — | Optimizer, evaluation, and run settings |
 
 Values can be changed from the command line without editing YAML:
 
 ```bash
-python train.py model=qwen data.batch_size=8 data.seq_len=512 training.device=cpu
+python train.py model=qwen training.batch_size=8 data.seq_len=512 training.device=cpu
 ```
 
 Hydra writes run output beneath `runs/YYYY-MM-DD/HH-MM-SS/`. A validation run
@@ -409,10 +348,9 @@ can write `best.pt` there; periodic checkpoints are enabled with
 ### Stop and resume training
 
 Checkpoints written by the current trainer contain the model, optimizer,
-learning-rate scheduler, Python/NumPy/PyTorch/CUDA RNG states, deterministic
-data cursor, token counter, W&B run ID, and the WSD trigger state. HF streaming
-checkpoints additionally carry the native `IterableDataset`/stateful-loader
-state, including its source shard/example position. Checkpoint
+learning-rate scheduler, Python/NumPy/PyTorch/CUDA RNG states, the global
+optimizer step, the memmap data cursor (the next batch of the current data
+pass), token counter, W&B run ID, and the WSD trigger state. Checkpoint
 writes use a temporary file plus an atomic rename, so an interrupted write
 cannot leave a partially written `latest.pt`.
 
@@ -427,11 +365,11 @@ You can also use `training.resume_from=latest` to select the newest
 `latest.pt` below the project directory. Pressing Ctrl-C, or receiving a
 graceful SIGTERM/SIGHUP, finishes the current optimizer step and writes
 `latest.pt`; the next command continues from the next batch and keeps the same
-W&B run. Keep the original data, model, batch size, sequence length, and stride
-for a bit-for-bit continuation; the training budget must also match, **unless
-the resume is a decay run** (`start_decay=true`): the trainer then re-derives
-the total budget from the trigger step and accepts a different configured
-budget. A hard power loss or `kill -9` can only resume from the most recent
+W&B run. Keep the original data, tokenizer, model, batch size, and sequence
+length for a bit-for-bit continuation. An exact resume keeps the saved phase
+endpoint; a stable continuation or manual decay may request an additional
+token budget and will expand/reprocess the cache if the train prefix is too
+short. A hard power loss or `kill -9` can only resume from the most recent
 periodic checkpoint, so choose `save_interval` according to the amount of work
 you are willing to repeat.
 
@@ -443,12 +381,14 @@ python train.py training.resume_from=latest \
   training.resume_mode=continue training.continue_tokens=100000000
 ```
 
-This mode is only for an untriggered stable checkpoint. It does not start a new
-warmup or decay; a later `start_decay=true` run uses the extended step timeline.
+This mode is only for a stable checkpoint. It does not start a new warmup or
+decay; a later `start_decay=true` run uses the extended step timeline. If the
+continuation is interrupted, resuming it with the same command finishes the
+saved endpoint without adding `continue_tokens` a second time.
 
-Checkpoints from the older trainer can still load their model and optimizer,
-but they do not contain the scheduler, RNG, data cursor, or W&B ID and are
-therefore not exact-resume checkpoints.
+Checkpoints from the old streaming trainer are not resumable with this
+trainer — they carry no memmap data cursor; resume raises with a clear error.
+Start a fresh run instead.
 
 Each run directory also holds a `run_manifest.json` (written in terminal mode
 as well) mapping every checkpoint file to the W&B run id/URL with per-save
@@ -460,40 +400,39 @@ of its manifest entry).
 
 ### Two-stage WSD training (warmup → stable → decay)
 
-The schedule is WSD: a linear warmup (`warmup_fraction` of the stage-1
-budget), a flat plateau at `lr` (the stable phase), and a final cosine decay
-to `min_lr` whose length is derived from where you stop.
+The schedule is WSD: a linear warmup (`warmup_fraction` of the selected
+phase-1 budget), a flat plateau at `lr` (the stable phase), and a final cosine
+decay to `min_lr` over the explicit `training.decay_tokens` budget.
 
-**Stage 1** — train warmup + stable against a budget you choose. Stop early
+**Stage 1** — train warmup + stable over the data file. Stop early
 with Ctrl-C (the trainer writes `latest.pt` after the current optimizer step)
-or let it run out the budget:
-
-```bash
-python train.py training.max_steps=10000
-```
+or let it run the whole pass:
 
 **Stage 2** — resume from `latest.pt`: either keep the stable plateau
 (extending pretraining in any number of increments) or start the final decay:
 
 ```bash
-python train.py training.resume_from=latest                # keep stable
-python train.py training.resume_from=latest start_decay=true   # decay, then stop
+python train.py training.resume_from=latest \
+  training.resume_mode=continue training.continue_tokens=1b
+python train.py training.resume_from=latest training.start_decay=true \
+  training.decay_tokens=1b
 ```
 
-With `start_decay=true` and resume step `S`, the decay lasts
-`D = round(S · f / (1 − f))` steps, where `f = training.lr_decay_fraction`
-is the fraction of the whole run the decay occupies, and the run **stops
-exactly when the decay finishes** — no steps are wasted at the floor.
-Example: `S = 30` with `f = 0.2` → `D = 8`, total `38` steps.
+With `start_decay=true`, the decay starts at the checkpoint's current step and
+rounds `training.decay_tokens` down to complete optimizer steps. The run
+**stops exactly when that decay budget finishes** — no steps are wasted at the
+floor. For example, with 64K tokens per optimizer step,
+`training.decay_tokens=1m` produces 15 complete decay steps (960K effective
+tokens).
 
 - Stage 2 continues stage 1's W&B run (the checkpoint carries the run id), so
   both phases appear as one continuous loss curve. The run page records the
   stage (`training_stage`: `stage-1-stable` / `stage-2-stable` /
-  `stage-2-decay`) and, for decay runs, the trigger step; the
-  W&B-computed budget values reflect the decay run's derived budget.
-- The terminal output of a decay run prints the derived budget
-  (`budget=wsd_decay`) and the current learning rate on every progress line,
-  so local output matches W&B.
+  `stage-2-decay`) and, for decay runs, the trigger step; the W&B-computed
+  fields include the requested/effective phase budget and cache capacity.
+- The terminal output of a decay run prints the explicit budget
+  (`budget=wsd_decay_tokens`), its effective complete-step token count, and the
+  current learning rate on every progress line, so local output matches W&B.
 - A crash mid-decay resumes correctly: the trigger state is saved inside the
   checkpoint, and a resumed decay continues from the original trigger step
   instead of restarting the decay.
@@ -561,7 +500,7 @@ The test suite covers causal attention, model-config validation, token-shard
 datasets, checkpoint state, the training schedule (including the WSD two-stage
 budget, resume consistency, the run manifest, and W&B artifacts), and six
 end-to-end training-loop behaviors (budget stop, signal/KeyboardInterrupt
-stops, best-checkpoint improvement, periodic saves, and resume cursor) driven
+stops, best-checkpoint improvement, periodic saves, and resume step) driven
 on a stub-constructed trainer without GPU, W&B, or corpora.
 
 ## Roadmap

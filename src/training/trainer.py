@@ -11,7 +11,8 @@ import torch
 from omegaconf import OmegaConf
 from torch.nn.utils import clip_grad_norm_
 
-from data.dataloader import create_dataloaders
+from data.dataloader import MemmapDataLoader
+from data.prepare import get_data_dir
 from data.tokenizer import get_tokenizer, text_to_token_ids, token_ids_to_text
 from models.gpt import GptModel
 from training.checkpointing import (
@@ -39,10 +40,8 @@ from training.run_manifest import (
 )
 from training.schedule import (
     build_lr_lambda,
-    resolve_decay_budget,
-    resolve_continuation_steps,
-    resolve_total_steps,
-    resolve_wsd_state,
+    phase_state,
+    resolve_phase_budget,
     stage_label,
 )
 
@@ -180,21 +179,70 @@ class Trainer:
         self._print_model_summary()
 
     def _setup_data(self):
-        """Tokenizer, dataloaders, per-step / per-epoch token counts,
-        optimizer, and loss."""
+        """Tokenizer, memmap dataloaders, micro-batch / per-step token
+        counts, optimizer, and loss."""
         self.tokenizer = get_tokenizer(self.cfg.data.tokenizer_name)
-        self.train_loader, self.val_loader = create_dataloaders(
-            self.cfg.data, training_cfg=self.cfg.training
+        data_dir = get_data_dir(self.cfg)
+        self.data_dir = data_dir
+        batch_size = int(self.cfg.training.batch_size)
+        self.accum_steps = int(self.cfg.training.accum_steps)
+        seq_len = int(self.cfg.data.seq_len)
+        self.tokens_per_step = batch_size * seq_len * self.accum_steps
+
+        # Resolve the requested endpoint before creating the loaders.  The
+        # extra lookahead token is required because each training window reads
+        # one shifted target token beyond its counted input tokens.
+        self.phase_budget = resolve_phase_budget(
+            self.cfg.training,
+            self.resume_checkpoint,
+            self.tokens_per_step,
+        )
+        train_limit_tokens = None
+        if self.phase_budget.target_step is not None:
+            train_limit_tokens = (
+                self.phase_budget.target_step * self.tokens_per_step + 1
+            )
+        self.train_loader = MemmapDataLoader(
+            data_dir,
+            "train",
+            batch_size,
+            seq_len,
+            self.device,
+            max_tokens=train_limit_tokens,
+        )
+        physical_batches = (len(self.train_loader.data) - 1) // self.train_loader.batch_tokens
+        self.available_steps_per_pass = max(1, physical_batches // self.accum_steps)
+        self.val_loader = MemmapDataLoader(
+            data_dir, "eval", batch_size, seq_len, self.device
+        )
+        if len(self.train_loader) == 0:
+            raise ValueError(
+                "The training data holds fewer tokens than one micro-batch "
+                f"({batch_size * seq_len:,}); increase data.max_tokens or "
+                "reduce training.batch_size / data.seq_len."
+            )
+        # Shadow loader for the train-loss eval line: reads the same train
+        # file without touching the main stream's position.
+        self.train_eval_loader = MemmapDataLoader(
+            data_dir,
+            "train",
+            batch_size,
+            seq_len,
+            self.device,
+            max_tokens=train_limit_tokens,
         )
 
-        self.steps_per_epoch = len(self.train_loader)
-        self.tokens_per_step = int(self.cfg.data.batch_size) * int(
-            self.cfg.data.seq_len
-        )
+        # One data pass = one scan of the train file (single pass over the
+        # data). The loader yields micro-batches; an optimizer step consumes
+        # accum_steps of them, so the file capacity in optimizer steps is
+        # len // accum_steps and one step moves batch_size * seq_len *
+        # accum_steps tokens.
+        self.steps_per_pass = max(1, len(self.train_loader) // self.accum_steps)
 
         optimizer_kwargs = {
             "lr": float(self.cfg.training.lr),
             "weight_decay": float(self.cfg.training.weight_decay),
+            "betas" : [float(self.cfg.training.beta1), float(self.cfg.training.beta2)]
         }
         if self.device.type == "cuda":
             optimizer_kwargs["fused"] = True
@@ -203,12 +251,9 @@ class Trainer:
         self.criterion = torch.nn.CrossEntropyLoss()
 
     def _resolve_budget(self):
-        """Counter initialization, total-step resolution, the pre-restore WSD
-        decision, the resume-consistency check, and the budget prints."""
+        """Resolve the explicit phase endpoint and validate resume geometry."""
         self.step = 0
         self.best_val_loss = float("inf")
-        self.epoch = 0
-        self.batch_in_epoch = 0
         self.tokens_seen = 0
         self.run_elapsed_seconds = 0.0
         self.stop_requested = False
@@ -217,169 +262,97 @@ class Trainer:
         self.resume_mode = str(getattr(self.cfg.training, "resume_mode", "exact"))
         if self.resume_mode not in {"exact", "continue"}:
             raise ValueError("training.resume_mode must be 'exact' or 'continue'")
-        self.continuation_run = self.resume_mode == "continue"
 
-        if self.continuation_run:
-            if self.resume_checkpoint is None:
-                raise ValueError(
-                    "training.resume_mode=continue requires training.resume_from."
-                )
-            if (
-                getattr(self.cfg.training, "max_steps", None) is not None
-                or getattr(self.cfg.training, "max_tokens", None) is not None
-            ):
-                raise ValueError(
-                    "Stable continuation uses training.continue_tokens; clear "
-                    "training.max_steps and training.max_tokens."
-                )
-            saved_wsd = self.resume_checkpoint.get("wsd") or {}
-            if saved_wsd.get("triggered") is True or bool(
-                getattr(self.cfg.training, "start_decay", False)
-            ):
-                raise ValueError(
-                    "Stable continuation is only for an untriggered plateau; "
-                    "use resume_mode=exact with start_decay for WSD decay."
-                )
-            additional_steps = resolve_continuation_steps(
-                self.cfg.training, self.tokens_per_step
-            )
-            saved_step = int(self.resume_checkpoint.get("step", 0))
-            self.total_steps = saved_step + additional_steps
-            self.budget_name = "continue_tokens"
-        else:
-            if getattr(self.cfg.training, "continue_tokens", None) is not None:
-                raise ValueError(
-                    "training.continue_tokens requires training.resume_mode=continue."
-                )
-            if self._is_streaming_run():
-                self._check_streaming_budget()
-            self.total_steps, self.budget_name = resolve_total_steps(
-                self.cfg.training, self.steps_per_epoch, self.tokens_per_step
-            )
-        self.total_train_tokens = self.total_steps * self.tokens_per_step
-
-        # Will this resume trigger or continue a WSD decay? Decidable before
-        # the step counter is restored: the start_decay flag or a triggered
-        # state saved in the checkpoint.
-        saved_wsd = (
-            self.resume_checkpoint.get("wsd")
-            if self.resume_checkpoint is not None
-            else None
+        # _setup_data resolves this before the loader is built.  The fallback
+        # keeps the small Trainer.__new__ test seam and older callers working.
+        self.phase_budget = getattr(
+            self,
+            "phase_budget",
+            resolve_phase_budget(
+                self.cfg.training,
+                self.resume_checkpoint,
+                self.tokens_per_step,
+            ),
         )
+        self.continuation_run = self.phase_budget.mode == "stable_continue"
+        self.decay_run = self.phase_budget.stage == "decay"
         self.start_decay_requested = bool(
             getattr(self.cfg.training, "start_decay", False)
         )
-        # Decidable before the step counter is restored: only whether a
-        # decay triggers matters here (the true trigger step is filled in
-        # after the restore), so resume_step=0 is a placeholder.
-        self.decay_run = bool(
-            self.resume_checkpoint is not None
-            and resolve_wsd_state(saved_wsd, self.start_decay_requested, 0)["triggered"]
+
+        self.total_steps = (
+            self.phase_budget.target_step
+            if self.phase_budget.target_step is not None
+            else self.steps_per_pass
         )
+        budget_names = {
+            "one_pass": "one_pass",
+            "train_tokens": "train_tokens",
+            "stable_continue": "continue_tokens",
+            "decay_tokens": "wsd_decay_tokens",
+            "legacy_decay": "wsd_decay_legacy",
+            "exact_resume": "exact_resume",
+        }
+        self.budget_name = budget_names.get(
+            self.phase_budget.mode, self.phase_budget.mode
+        )
+        self.total_train_tokens = self.total_steps * self.tokens_per_step
 
         if self.resume_checkpoint is not None:
             check_resume_consistency(
                 saved_total_steps=self.resume_checkpoint.get("total_steps"),
                 total_steps=self.total_steps,
-                saved_steps_per_epoch=self.resume_checkpoint.get("steps_per_epoch"),
-                steps_per_epoch=self.steps_per_epoch,
+                saved_steps_per_pass=self.resume_checkpoint.get(
+                    "steps_per_pass"
+                ),
+                steps_per_pass=self.steps_per_pass,
+                saved_tokens_per_step=self.resume_checkpoint.get(
+                    "tokens_per_step"
+                ),
+                tokens_per_step=self.tokens_per_step,
                 decay_run=self.decay_run,
                 continuation_run=self.continuation_run,
+                allow_capacity_growth=self.continuation_run or self.decay_run,
+                available_steps_per_pass=getattr(
+                    self, "available_steps_per_pass", self.steps_per_pass
+                ),
             )
 
-        # Decay runs re-print their derived budget after the override below.
-        if not self.decay_run:
-            self._print_budget_summary()
-
-    def _is_streaming_run(self) -> bool:
-        """True when the training loader is the stateful HF streaming loader."""
-        loader = getattr(self, "train_loader", None)
-        return bool(getattr(loader, "stream_stateful", False))
-
-    def _check_streaming_budget(self):
-        """Enforce the explicit-budget contract for streaming runs.
-
-        A streamed HF source is unbounded: it has no corpus size to size an
-        epoch, so ``training.epochs`` (a data-pass count) cannot be converted
-        to optimizer steps. Streaming runs must state their budget in
-        complete optimizer steps (``training.max_steps``) or window tokens
-        (``training.max_tokens``), where one step consumes ``batch_size *
-        seq_len`` window tokens.
-        """
-        max_steps = getattr(self.cfg.training, "max_steps", None)
-        max_tokens = getattr(self.cfg.training, "max_tokens", None)
-
-        if max_steps is None and max_tokens is None:
-            raise ValueError(
-                "HF streaming runs need an explicit training budget: the "
-                "stream is unbounded, so training.epochs (a data-pass count) "
-                "cannot be converted to optimizer steps. Set "
-                "training.max_steps (complete optimizer steps) or "
-                "training.max_tokens (window tokens; one step = "
-                f"{self.tokens_per_step:,} window tokens = batch_size x "
-                "seq_len)."
-            )
-        if max_steps is not None and int(max_steps) < 1:
-            raise ValueError(
-                f"training.max_steps must be at least 1 for a streaming run; "
-                f"got {max_steps}."
-            )
-        if max_tokens is not None and int(max_tokens) < self.tokens_per_step:
-            raise ValueError(
-                f"training.max_tokens={int(max_tokens):,} is smaller than one "
-                f"complete optimizer step ({self.tokens_per_step:,} window "
-                "tokens). Streaming runs stop only on complete steps; increase "
-                "training.max_tokens or use training.max_steps instead."
-            )
+        self._print_budget_summary()
 
     def _print_budget_summary(self):
-        """Console budget report. Streaming runs label the token counts as
-        window tokens (batch_size x seq_len per optimizer step), not unique
-        source tokens consumed from the stream."""
-        if self._is_streaming_run():
+        """Console budget report."""
+        print(f"Optimizer steps: {self.total_steps:,} (budget={self.budget_name})")
+        print(f"Training tokens: {format_count(self.total_train_tokens)}")
+        if self.phase_budget.requested_tokens is not None:
             print(
-                f"Optimizer steps: {self.total_steps:,} "
-                f"(budget={self.budget_name}; "
-                f"{self.tokens_per_step:,} window tokens/step)"
+                "Phase tokens: "
+                f"requested={format_count(self.phase_budget.requested_tokens)} | "
+                f"effective={format_count(self.phase_budget.effective_tokens)}"
             )
-            if self.budget_name == "max_tokens":
-                requested = int(self.cfg.training.max_tokens)
-                print(
-                    f"Window tokens: {self.total_train_tokens:,} "
-                    f"(training.max_tokens={requested:,} rounded down to "
-                    f"{self.total_steps:,} complete steps)"
-                )
-            else:
-                print(f"Window tokens: {self.total_train_tokens:,}")
-        else:
+        print(
+            "Phase: "
+            f"{self.phase_budget.stage} | start={self.phase_budget.start_step:,} | "
+            f"target={self.phase_budget.target_step if self.phase_budget.target_step is not None else 'cache end'}"
+        )
+        if hasattr(self, "train_loader") and hasattr(self, "val_loader"):
             print(
-                f"Optimizer steps: {self.total_steps:,} "
-                f"({self.steps_per_epoch:,}/data pass; budget={self.budget_name})"
+                "Cache: "
+                f"{len(self.train_loader.data) + len(self.val_loader.data):,} total | "
+                f"{len(self.train_loader.data):,} train | "
+                f"{len(self.val_loader.data):,} val | "
+                f"phase loader={self.train_loader.total_tokens:,} train tokens"
             )
-            print(f"Training tokens: {format_count(self.total_train_tokens)}")
 
     def _apply_resume(self):
-        """Counter / cursor / RNG / W&B-id restore, the WSD state seed, the
-        stage label, and the decay-budget override with its prints."""
+        """Restore state, seed the explicit phase state, and print its budget."""
         if self.resume_checkpoint is not None:
             self._restore_training_state(self.resume_checkpoint)
 
-        # --- LR scheduler: WSD ---
-        # Seed the live WSD state after the restore so a triggered state saved
-        # in the checkpoint wins over a fresh start_decay flag (a crash
-        # mid-decay resumes from the original trigger step). Fresh runs never
-        # trigger a decay.
-        saved_wsd = (
-            self.resume_checkpoint.get("wsd")
-            if self.resume_checkpoint is not None
-            else None
-        )
-        if self.resume_checkpoint is not None:
-            self.wsd_decay = resolve_wsd_state(
-                saved_wsd, self.start_decay_requested, self.step
-            )
-        else:
-            self.wsd_decay = {"triggered": False, "step": None}
+        # A saved explicit endpoint wins over command-line flags.  For a new
+        # request phase_budget was resolved before loader construction; its
+        # start step is the restored checkpoint step.
+        self.wsd_decay = phase_state(self.phase_budget)
         decay_triggered = self.wsd_decay["triggered"]
         self.stage_label = stage_label(
             resumed=self.resume_checkpoint is not None,
@@ -387,21 +360,18 @@ class Trainer:
         )
 
         if decay_triggered:
-            # Decay runs re-derive their budget from the trigger step
-            # (rule of three): D = round(S*f/(1-f)). The run stops exactly
-            # when the decay finishes.
-            decay_fraction = float(self.cfg.training.lr_decay_fraction)
-            self.total_steps, decay_steps = resolve_decay_budget(
-                self.wsd_decay["step"], decay_fraction
-            )
-            self.budget_name = "wsd_decay"
-            self.total_train_tokens = self.total_steps * self.tokens_per_step
             print(
-                f"WSD decay: trigger step S={self.wsd_decay['step']}, "
-                f"decay steps D={decay_steps} "
-                f"(lr_decay_fraction={decay_fraction})"
+                f"WSD decay: start step S={self.wsd_decay['decay_start_step']}, "
+                f"additional tokens={format_count(self.wsd_decay['effective_tokens'])}, "
+                f"decay steps D={self.wsd_decay['decay_steps']}, "
+                f"end step={self.wsd_decay['target_step']}"
             )
-            self._print_budget_summary()
+        elif self.phase_budget.mode == "stable_continue":
+            print(
+                f"Stable continuation: additional tokens="
+                f"{format_count(self.phase_budget.effective_tokens)}, "
+                f"end step={self.phase_budget.target_step}"
+            )
 
     def _build_scheduler(self):
         """Warmup / decay math and the LR lambda, then the scheduler — and
@@ -411,22 +381,20 @@ class Trainer:
         optimizer's current LR)."""
         peak_lr = float(self.cfg.training.lr)
         min_lr = float(getattr(self.cfg.training, "min_lr", peak_lr * 0.1))
-        decay_fraction = float(self.cfg.training.lr_decay_fraction)
         if self.wsd_decay["triggered"]:
-            # Decay runs skip warmup (stage 1 already ran it); the decay
-            # budget was derived from the trigger step in _apply_resume.
             warmup = 0
-            decay_steps = resolve_decay_budget(self.wsd_decay["step"], decay_fraction)[
-                1
-            ]
-        elif self.continuation_run:
-            # The continuation is an extension of an already-trained stable
-            # run. It must not introduce a second warmup window.
+            decay_steps = int(
+                self.wsd_decay.get("decay_steps")
+                or self.total_steps - self.wsd_decay["step"]
+            )
+        elif self.continuation_run or self.resume_checkpoint is not None:
+            # A resume is an extension of an already-trained stable run. It
+            # must not introduce a second warmup window.
             warmup = 0
-            decay_steps = max(1, int(decay_fraction * self.total_steps))
+            decay_steps = 1
         else:
             warmup = int(self.cfg.training.warmup_fraction * self.total_steps)
-            decay_steps = int(decay_fraction * self.total_steps)
+            decay_steps = 1
 
         lr_lambda = build_lr_lambda(
             warmup, decay_steps, peak_lr, min_lr, self.wsd_decay
@@ -435,20 +403,23 @@ class Trainer:
             self.optimizer, lr_lambda=lr_lambda
         )
         if self.resume_checkpoint is not None:
-            scheduler_state = self.resume_checkpoint.get("scheduler")
-            if scheduler_state is not None:
-                self.scheduler.load_state_dict(scheduler_state)
-            else:
-                print(
-                    "Warning: checkpoint has no scheduler state; this is a legacy "
-                    "checkpoint and cannot be resumed bit-for-bit."
+            if self.resume_checkpoint.get("scheduler") is None:
+                raise ValueError(
+                    "The checkpoint does not carry scheduler state; it is "
+                    "not resumable with this trainer. Start a fresh run "
+                    "instead."
                 )
-            optimizer_state = self.resume_checkpoint.get("optimizer")
-            if optimizer_state is not None:
-                # LambdaLR construction initializes the optimizer's current
-                # learning rate. Load the optimizer after the scheduler so
-                # the checkpoint's exact current LR wins.
-                self.optimizer.load_state_dict(optimizer_state)
+            if self.resume_checkpoint.get("optimizer") is None:
+                raise ValueError(
+                    "The checkpoint does not carry optimizer state; it is "
+                    "not resumable with this trainer. Start a fresh run "
+                    "instead."
+                )
+            # Load the optimizer after the scheduler so the checkpoint's
+            # exact current LR wins (LambdaLR construction reinitializes
+            # the optimizer's current LR).
+            self.scheduler.load_state_dict(self.resume_checkpoint["scheduler"])
+            self.optimizer.load_state_dict(self.resume_checkpoint["optimizer"])
 
     def _setup_logging(self):
         """Backend resolution, the adapter init, and the initial
@@ -481,11 +452,24 @@ class Trainer:
             config=OmegaConf.to_container(self.cfg, resolve=True),
             saved_config=saved_cfg if isinstance(saved_cfg, dict) else None,
             computed={
-                "computed_steps_per_epoch": self.steps_per_epoch,
+                "computed_steps_per_pass": self.steps_per_pass,
                 "computed_total_steps": self.total_steps,
                 "computed_tokens_per_step": self.tokens_per_step,
                 "computed_total_train_tokens": self.total_train_tokens,
                 "computed_budget_name": self.budget_name,
+                "computed_phase_mode": self.phase_budget.mode,
+                "computed_phase_stage": self.phase_budget.stage,
+                "computed_requested_phase_tokens": self.phase_budget.requested_tokens,
+                "computed_effective_phase_tokens": self.phase_budget.effective_tokens,
+                "computed_phase_target_step": self.phase_budget.target_step,
+                "computed_decay_steps": self.phase_budget.decay_steps,
+                "computed_train_loader_tokens": self.train_loader.total_tokens,
+                "computed_available_train_tokens": len(self.train_loader.data),
+                "computed_available_val_tokens": len(self.val_loader.data),
+                "computed_available_cache_tokens": len(self.train_loader.data)
+                + len(self.val_loader.data),
+                "computed_available_steps_per_pass": self.available_steps_per_pass,
+                "computed_phase_start_step": self.phase_budget.start_step,
             },
             stage_marker=stage_marker,
             parameter_metrics=self.model_parameter_metrics,
@@ -525,39 +509,21 @@ class Trainer:
             best_val_loss=self.best_val_loss,
             wandb_run_id=self.wandb_run_id,
             run_elapsed_seconds=self.run_elapsed_seconds,
-            epoch=self.epoch,
-            batch_in_epoch=self.batch_in_epoch,
             tokens_seen=self.tokens_seen,
-            steps_per_epoch=self.steps_per_epoch,
             tokens_per_step=self.tokens_per_step,
             train_loader=self.train_loader,
-            val_loader=self.val_loader,
         )
         restore_training_state(bundle, checkpoint)
         self.step = bundle.step
         self.best_val_loss = bundle.best_val_loss
         self.wandb_run_id = bundle.wandb_run_id
         self.run_elapsed_seconds = bundle.run_elapsed_seconds
-        self.epoch = bundle.epoch
-        self.batch_in_epoch = bundle.batch_in_epoch
         self.tokens_seen = bundle.tokens_seen
 
-    def _set_train_epoch(self, epoch):
-        """Set the deterministic sampler to the logical data-pass number.
-
-        The dedicated eval loader (map-style runs) shares the train
-        seed, so it needs the same epoch to stay on the same permutation.
-        """
-        loaders = [self.train_loader]
-        eval_loader = getattr(self.train_loader, "eval_loader", None)
-        if eval_loader is not None:
-            loaders.append(eval_loader)
-        for loader in loaders:
-            sampler = getattr(loader, "sampler", None)
-            if hasattr(sampler, "set_epoch"):
-                sampler.set_epoch(epoch)
-
     def _capture_rng_state(self):
+        # The memmap dataloaders have no RNG of their own: the data stream
+        # is a deterministic scan and its position is checkpointed as
+        # data_state.
         return {
             "python": random.getstate(),
             "numpy": np.random.get_state(),
@@ -565,14 +531,6 @@ class Trainer:
             "cuda": (
                 torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
             ),
-            "dataloader": {
-                "train": getattr(self.train_loader, "generator", None).get_state()
-                if getattr(self.train_loader, "generator", None) is not None
-                else None,
-                "val": getattr(self.val_loader, "generator", None).get_state()
-                if getattr(self.val_loader, "generator", None) is not None
-                else None,
-            },
         }
 
     def _configure_cuda_features(self):
@@ -677,17 +635,21 @@ class Trainer:
         """Log metrics through the run's log backend adapter."""
         self.logger.log_metrics(metrics, self.step)
 
-    def train_step(self, x, y):
-        """Run one optimization step and return the scalar loss."""
+    def train_step(self, micro_batches):
+        """One optimizer step over a group of micro-batches (gradient
+        accumulation): gradients are summed (each micro-batch loss is
+        scaled by 1/accum_steps), clipped, then a single optimizer + LR
+        step is taken."""
         self.optimizer.zero_grad()
-        # x: [B, S] token ids -> model -> logits [B, S, V]; y: [B, S] target ids
-        loss = self.calc_loss_batch(x, y)
-
-        loss.backward()
+        total = 0.0
+        for x, y in micro_batches:
+            loss = self.calc_loss_batch(x, y) / self.accum_steps
+            loss.backward()
+            total += loss.item()
         clip_grad_norm_(self.model.parameters(), self.cfg.training.max_grad_norm)
         self.optimizer.step()
         self.scheduler.step()
-        return loss.item()
+        return total
 
     def evaluate(self):
         """Run validation and return (avg_loss, perplexity)."""
@@ -696,11 +658,14 @@ class Trainer:
             getattr(self.cfg.training, "eval_batches", self.cfg.training.eval_interval)
         )
         with torch.no_grad():
-            train_eval_loader = getattr(
-                self.train_loader, "eval_loader", self.train_loader
-            )
+            # Train-loss line over the first eval_batches batches of
+            # train.bin — a fixed, deterministic window: the scan is
+            # sequential, so the start of every data pass is batch 0. The
+            # shadow loader keeps the main train stream's position
+            # untouched, so evals never consume or rewind it.
+            self.train_eval_loader.load_state_dict({"current_step": 0})
             train_loss = self.calc_loss_loader(
-                train_eval_loader, num_batches=eval_batches
+                self.train_eval_loader, num_batches=eval_batches
             )
             val_loss = self.calc_loss_loader(self.val_loader, num_batches=eval_batches)
             train_perplexity, val_perplexity = math.exp(train_loss), math.exp(val_loss)
@@ -721,13 +686,9 @@ class Trainer:
                 scheduler_state=self.scheduler.state_dict(),
                 step=self.step,
                 best_val_loss=self.best_val_loss,
-                cursor={
-                    "epoch": self.epoch,
-                    "batch_in_epoch": self.batch_in_epoch,
-                },
                 tokens_seen=self.tokens_seen,
                 run_elapsed_seconds=getattr(self, "run_elapsed_seconds", 0.0),
-                steps_per_epoch=self.steps_per_epoch,
+                steps_per_pass=self.steps_per_pass,
                 tokens_per_step=self.tokens_per_step,
                 total_steps=self.total_steps,
                 wandb_run_id=self.wandb_run_id,
@@ -841,7 +802,7 @@ class Trainer:
         self._update_run_elapsed()
         self.save_checkpoint(os.path.join(self.save_dir, "latest.pt"), kind="latest")
 
-    def _log_progress(self, loss, current_epoch):
+    def _log_progress(self, loss):
         """Timer math (CUDA events on GPU, wall clock on CPU), the progress
         metrics, and the console line for one logged step."""
         if self._use_cuda_timer:
@@ -872,30 +833,20 @@ class Trainer:
                 "run/elapsed_seconds": self.run_elapsed_seconds,
                 "run/elapsed_minutes": self.run_elapsed_seconds / 60,
                 "run/elapsed_hours": self.run_elapsed_seconds / 3600,
-                "run/steps_per_epoch": self.steps_per_epoch,
+                "run/steps_per_epoch": self.steps_per_pass,
                 "run/total_steps": self.total_steps,
                 "run/steps_remaining": steps_remaining,
+                "run/tokens_remaining": steps_remaining * self.tokens_per_step,
                 "run/progress": progress,
                 "run/estimated_remaining_seconds": estimated_remaining_seconds,
                 "step": self.step,
                 **memory_metrics,
             }
         )
-        if self._is_streaming_run():
-            # Streaming throughput is window tokens per second (batch_size x
-            # seq_len per step); labeling it as source tokens would
-            # overstate how much of the HF corpus is being consumed.
-            print(
-                f"step {self.step} | window tokens {format_count(self.tokens_seen)} | "
-                f"loss {loss:.4f} | lr {self.get_lr():.2e} | "
-                f"window tok/s {tok_per_sec:,.0f}"
-            )
-        else:
-            print(
-                f"data pass {current_epoch + 1} | step {self.step} | "
-                f"tokens {format_count(self.tokens_seen)} | loss {loss:.4f} | "
-                f"lr {self.get_lr():.2e} | tok/s {tok_per_sec:,.0f}"
-            )
+        print(
+            f"step {self.step} | tokens {format_count(self.tokens_seen)} | "
+            f"loss {loss:.4f} | lr {self.get_lr():.2e} | tok/s {tok_per_sec:,.0f}"
+        )
         self._log_start_tokens = self.tokens_seen
 
     def _run_evaluation(self):
@@ -939,7 +890,12 @@ class Trainer:
         print(f"Saving restart checkpoint at step {self.step}...")
         self._save_latest_checkpoint()
         self._log_metrics(
-            {"run/interrupted": 1, "run/steps_remaining": self.total_steps - self.step}
+            {
+                "run/interrupted": 1,
+                "run/steps_remaining": self.total_steps - self.step,
+                "run/tokens_remaining": max(self.total_steps - self.step, 0)
+                * self.tokens_per_step,
+            }
         )
 
     def _finish_run(self):
@@ -951,9 +907,10 @@ class Trainer:
                 "run/elapsed_seconds": self.run_elapsed_seconds,
                 "run/elapsed_minutes": self.run_elapsed_seconds / 60,
                 "run/elapsed_hours": self.run_elapsed_seconds / 3600,
-                "run/steps_per_epoch": self.steps_per_epoch,
+                "run/steps_per_epoch": self.steps_per_pass,
                 "run/total_steps": self.total_steps,
                 "run/steps_remaining": 0,
+                "run/tokens_remaining": 0,
                 "run/progress": 1.0,
                 "run/estimated_remaining_seconds": 0.0,
                 "step": self.step,
@@ -966,6 +923,14 @@ class Trainer:
 
     def train(self):
         """Outer training loop."""
+        if self.total_steps > self.steps_per_pass:
+            raise ValueError(
+                f"The training budget ({self.total_steps:,} steps) exceeds one "
+                f"pass over the data file ({self.steps_per_pass:,} steps). "
+                "The launcher should have expanded the cache before loader "
+                "construction; check data.max_tokens and the phase budget, "
+                "then resume from the last checkpoint."
+            )
         self.model.train()
         self._run_start_time = time.perf_counter()
         self._elapsed_before_run = self.run_elapsed_seconds
@@ -984,51 +949,39 @@ class Trainer:
         self._log_start_tokens = self.tokens_seen
 
         try:
+            batch_iter = iter(self.train_loader)
             while self.step < self.total_steps and not self.stop_requested:
-                current_epoch = self.epoch
-                self._set_train_epoch(current_epoch)
-                for batch_idx, (x, y) in enumerate(self.train_loader):
-                    if (
-                        not getattr(self.train_loader, "stream_stateful", False)
-                        and batch_idx < self.batch_in_epoch
-                    ):
-                        continue
-                    if self.step >= self.total_steps or self.stop_requested:
-                        break
+                # Pull one group of micro-batches for the optimizer step.
+                # A stop can be requested between pulls (e.g. between two
+                # micro-batches); it is honored before the step, so a
+                # checkpoint never lands mid-accumulation.
+                micro_batches = []
+                for _ in range(self.accum_steps):
+                    try:
+                        micro_batches.append(next(batch_iter))
+                    except StopIteration:
+                        raise RuntimeError(
+                            "Ran out of data before the budget was reached; "
+                            "the trainer does not rescan the file. This "
+                            "should be impossible: train() rejects budgets "
+                            "larger than one pass over the data."
+                        )
+                if self.stop_requested:
+                    break
 
-                    x, y = x.to(self.device), y.to(self.device)
-                    loss = self.train_step(x, y)
-                    self.step += 1
-                    self.tokens_seen += x.numel()
+                loss = self.train_step(micro_batches)
+                self.step += 1
+                self.tokens_seen += self.tokens_per_step
 
-                    # The cursor always points to the next batch to consume.
-                    if getattr(self.train_loader, "stream_stateful", False):
-                        # The HF adapter yields exactly one optimizer batch per
-                        # iterator. Its native stream state already points to
-                        # the next source window, so no batch skip is needed.
-                        self.epoch = current_epoch + 1
-                        self.batch_in_epoch = 0
-                    elif batch_idx + 1 >= len(self.train_loader):
-                        self.epoch = current_epoch + 1
-                        self.batch_in_epoch = 0
-                    else:
-                        self.epoch = current_epoch
-                        self.batch_in_epoch = batch_idx + 1
-
-                    if self.step % self.cfg.training.log_interval == 0:
-                        self._log_progress(loss, current_epoch)
-                    if self.step % self.cfg.training.eval_interval == 0:
-                        self._run_evaluation()
-                    if (
-                        self.cfg.training.save_interval
-                        and self.step % self.cfg.training.save_interval == 0
-                    ):
-                        self._save_periodic_checkpoint()
-                    if self.stop_requested:
-                        break
-                # A signal can arrive while the DataLoader is preparing the
-                # next batch, before the inner loop reaches the post-step
-                # check above.
+                if self.step % self.cfg.training.log_interval == 0:
+                    self._log_progress(loss)
+                if self.step % self.cfg.training.eval_interval == 0:
+                    self._run_evaluation()
+                if (
+                    self.cfg.training.save_interval
+                    and self.step % self.cfg.training.save_interval == 0
+                ):
+                    self._save_periodic_checkpoint()
                 if self.stop_requested:
                     break
 

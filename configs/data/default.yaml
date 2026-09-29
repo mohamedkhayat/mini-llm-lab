@@ -1,24 +1,19 @@
-source: files
-# The Verdict (small sample corpus, auto-downloaded to <project>/data/the_verdict)
-files:
-  - "data/the_verdict"
-max_files: null
-tokenized_dir: null
-hf_dataset: null
+# Hugging Face Hub dataset, tokenized to
+# data/<hf_dataset>/<tokenizer_name>/{train.bin, eval.bin, meta.json} by
+# src/data/prepare.py (train.py runs it automatically when the cache is
+# missing or stale). Training reads the .bin files with the sequential
+# memmap dataloader (src/data/dataloader.py).
+hf_dataset: HuggingFaceFW/finepdfs_edu_50BT-dclm_30BT-fineweb_edu_20BT-shuffled
 hf_config: null
+# Optional immutable Hugging Face revision. Reprocessed caches reuse the
+# revision recorded in their metadata when this is null.
+revision: null
 text_column: text
-split: train
-streaming: false
+file_format: parquet
 tokenizer_name: gpt2
-# The Verdict is only ~5k tokens: seq_len must stay small or the val split
-# has zero samples (1024/512 -> 0 val samples -> crash).
-seq_len: 256
-stride: 128
-batch_size: 2
+# Total tokens to tokenize and cache (train + eval, split by val_ratio).
+# The current phase budget lives under training.train_tokens,
+# training.continue_tokens, or training.decay_tokens.
+max_tokens: 6000000000
+seq_len: 1024
 val_ratio: 0.1
-shuffle: true
-drop_last: true
-num_workers: 4
-pin_memory: true
-persistent_workers: true
-seed: 42

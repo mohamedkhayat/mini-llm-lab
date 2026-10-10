@@ -62,7 +62,10 @@ class GracefulShutdown:
             self._restore()
             if signum == signal.SIGINT:
                 raise KeyboardInterrupt
-            signal.pthread_kill(os.getpid(), signum)
+            # F5: os.kill targets the process (pthread_kill expects a
+            # thread id); the restored default/previous handler now sees
+            # the signal and takes its normal effect.
+            os.kill(os.getpid(), signum)
             return
         self.stop.requested = True
         self.stop.signal_name = signal.Signals(signum).name

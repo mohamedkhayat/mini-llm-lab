@@ -42,6 +42,50 @@ def test_shutdown_first_and_second_signal(capsys):
     assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
 
 
+def test_second_signal_restores_handlers_then_uses_os_kill(monkeypatch):
+    """F5: a second non-INT signal re-raises via
+    os.kill(os.getpid(), signum) AFTER the previous handlers are
+    restored (the old pthread_kill passed a pid where a thread id
+    belongs). A first signal never calls os.kill, and a second SIGINT
+    still raises KeyboardInterrupt without it."""
+    order = []
+    monkeypatch.setattr(
+        os, "kill",
+        lambda pid, signum: order.append(("kill", pid, signum)),
+    )
+    real_signal = signal.signal
+
+    def spy_signal(num, handler):
+        order.append(("handler", num, handler))
+        return real_signal(num, handler)
+
+    monkeypatch.setattr(signal, "signal", spy_signal)
+
+    gs = GracefulShutdown()
+    with gs as stop:
+        gs._handle_signal(signal.SIGTERM, None)  # first: graceful
+        assert stop.requested is True
+        assert not [e for e in order if e[0] == "kill"], (
+            "a first signal never calls os.kill"
+        )
+
+        gs._handle_signal(signal.SIGTERM, None)  # second: force kill
+        kills = [e for e in order if e[0] == "kill"]
+        assert kills == [("kill", os.getpid(), signal.SIGTERM)]
+        # The kill is the LAST event: _restore() ran first.
+        assert order.index(kills[0]) == len(order) - 1
+
+    order.clear()
+    gs2 = GracefulShutdown()
+    with gs2 as stop:
+        gs2._handle_signal(signal.SIGINT, None)  # first: graceful
+        with pytest.raises(KeyboardInterrupt):
+            gs2._handle_signal(signal.SIGINT, None)  # second: re-raise
+    assert not [e for e in order if e[0] == "kill"], (
+        "a second SIGINT raises KeyboardInterrupt, not os.kill"
+    )
+
+
 def test_shutdown_is_a_noop_off_the_main_thread():
     """Off the main thread no handlers are installed (signal.signal is
     main-thread only) and exit restores nothing; the flag is still usable

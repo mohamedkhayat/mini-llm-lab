@@ -103,7 +103,7 @@ class RunLogger(ABC):
 
     @abstractmethod
     def finish(self) -> None:
-        """Flush and close the run."""""
+        """Flush and close the run."""
 
 
 class TerminalLogger(RunLogger):

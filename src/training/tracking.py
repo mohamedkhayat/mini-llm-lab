@@ -172,5 +172,11 @@ class RunTracker:
     def run_url(self):
         return self._logger.run_url
 
+    @property
+    def run_id(self) -> str | None:
+        """The underlying logger's run id (F3: forwarded so assembly can
+        persist it in ``state.wandb_run_id`` after ``start``)."""
+        return self._logger.run_id
+
     def finish(self) -> None:
         self._logger.finish()

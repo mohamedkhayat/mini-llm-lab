@@ -94,9 +94,16 @@ class RunLogger(ABC):
         """The run's public URL, when the backend has one (W&B)."""
         return None
 
+    @property
+    def run_id(self) -> str | None:
+        """The run's backend id (the W&B run id); None for backends
+        without one (terminal). Read by assembly after ``init`` so the
+        id can be persisted in checkpoints (F3)."""
+        return None
+
     @abstractmethod
     def finish(self) -> None:
-        """Flush and close the run."""
+        """Flush and close the run."""""
 
 
 class TerminalLogger(RunLogger):
@@ -132,7 +139,6 @@ class WandbLogger(RunLogger):
             wandb_module = wandb
         self._wandb = wandb_module
         self.upload_artifacts = bool(upload_artifacts)
-        self.run_id = None
         self._run = None
 
     def init(self, info: RunInfo) -> None:
@@ -159,8 +165,6 @@ class WandbLogger(RunLogger):
             print(f"Resuming W&B run: {resumed_run_id}")
         self._wandb.init(**wandb_kwargs)
         self._run = self._wandb.run
-        if self._run is not None:
-            self.run_id = self._run.id
 
         self._wandb.config.update(
             {
@@ -201,6 +205,11 @@ class WandbLogger(RunLogger):
         if self._run is None:
             return None
         return getattr(self._run, "url", None)
+
+    @property
+    def run_id(self):
+        """The W&B run's id (None until ``init`` has started the run)."""
+        return self._run.id if self._run is not None else None
 
     def finish(self) -> None:
         if self._run is not None:

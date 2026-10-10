@@ -493,6 +493,11 @@ def build_tracker(cfg, checkpoint, budget, state, stage_label_str, runtime,
         train_loader=train_loader,
         val_loader=val_loader,
     ))
+    # F3: persist the backend's run id into state BEFORE any checkpoint
+    # save, so payloads carry it and a resume reuses the same W&B run
+    # (resume='must'). Terminal backends report None and keep id-less.
+    if tracker.run_id is not None:
+        state.wandb_run_id = tracker.run_id
     return tracker
 
 

@@ -1,5 +1,10 @@
+from pathlib import Path
+
+import torch
 import wandb
 
+from conftest import TOKENS_PER_STEP
+from training.assembly import build_trainer
 from training.log_backend import (
     RunInfo,
     TerminalLogger,
@@ -8,6 +13,14 @@ from training.log_backend import (
     log_artifact,
     should_log_artifacts,
 )
+
+
+class FakeRun:
+    """The wandb run object returned by init (carries id + url)."""
+
+    def __init__(self, run_id):
+        self.id = run_id
+        self.url = f"https://wandb.test/{run_id}"
 
 
 class FakeArtifact:
@@ -24,12 +37,16 @@ class FakeArtifact:
 class FakeWandb:
     """Minimal stand-in for the wandb module: records run and artifact activity."""
 
-    def __init__(self, fail_at="none"):
+    def __init__(self, fail_at="none", run_id="abc123"):
         self.fail_at = fail_at  # "none" | "create" | "log"
+        self.run_id = run_id
         self.run = None
         self.logged = []
         self.init_calls = []
         self.config = {}
+
+    def Html(self, data):
+        return f"<html>{data}</html>"
 
     def Artifact(self, name, type):
         if self.fail_at == "create":
@@ -43,7 +60,10 @@ class FakeWandb:
 
     def init(self, *args, **kwargs):
         self.init_calls.append(kwargs)
-        return None
+        # A resumed init keeps the requested id; a fresh one gets the
+        # fixed (or configured) id.
+        self.run = FakeRun(kwargs.get("id", self.run_id))
+        return self.run
 
     def log(self, *args, **kwargs):
         pass
@@ -238,3 +258,70 @@ def test_wandb_adapter_resumed_run_keeps_the_original_config_and_name():
             "resume": "must",
         }
     ]
+    # The run id surfaces through the adapter (F3: state persistence reads
+    # this after tracker.start).
+    assert logger.run_id == "abc123"
+
+
+def test_first_checkpoint_payload_carries_the_wandb_run_id(tiny_cfg):
+    """F3: after tracker.start, state.wandb_run_id is set from the
+    logger's run, so the first checkpoint payload persists the id."""
+    tiny_cfg.training.train_tokens = 5 * TOKENS_PER_STEP
+    tiny_cfg.training.save_interval = 2
+    fake = FakeWandb(run_id="abc123")
+    trainer = build_trainer(tiny_cfg, logger=WandbLogger(wandb_module=fake))
+    trainer.train()
+
+    assert trainer.state.wandb_run_id == "abc123"
+    ckpt = torch.load(
+        Path(trainer.ckpt.save_dir) / "latest.pt",
+        map_location="cpu", weights_only=False,
+    )
+    assert ckpt["wandb_run_id"] == "abc123"
+
+
+def test_resume_reuses_the_saved_wandb_run_id(tiny_cfg):
+    """F3: a checkpoint written with a run id resumes into the SAME W&B
+    run: wandb.init is called with id=<saved id> and resume='must'."""
+    tiny_cfg.training.train_tokens = 5 * TOKENS_PER_STEP
+    tiny_cfg.training.save_interval = 2
+
+    first = FakeWandb(run_id="abc123")
+    trainer = build_trainer(tiny_cfg, logger=WandbLogger(wandb_module=first))
+    trainer.train()
+    ckpt = torch.load(
+        Path(trainer.ckpt.save_dir) / "final_model.pt",
+        map_location="cpu", weights_only=False,
+    )
+    assert ckpt["wandb_run_id"] == "abc123"
+
+    second = FakeWandb(run_id="fresh-should-not-be-used")
+    resumed = build_trainer(
+        tiny_cfg, checkpoint=ckpt, logger=WandbLogger(wandb_module=second)
+    )
+
+    assert resumed.state.wandb_run_id == "abc123"
+    assert second.init_calls == [
+        {
+            "project": "mini-llm-lab",
+            "name": "tiny",
+            "config": ckpt["cfg"],
+            "id": "abc123",
+            "resume": "must",
+        }
+    ]
+
+
+def test_terminal_backend_keeps_wandb_run_id_none(tiny_cfg):
+    """F3: terminal runs (no injected logger, no W&B at all) keep
+    state.wandb_run_id = None and persist None in the payload."""
+    tiny_cfg.training.train_tokens = 5 * TOKENS_PER_STEP
+    trainer = build_trainer(tiny_cfg)  # tiny_cfg: log_backend=terminal
+    trainer.train()
+
+    assert trainer.state.wandb_run_id is None
+    ckpt = torch.load(
+        Path(trainer.ckpt.save_dir) / "final_model.pt",
+        map_location="cpu", weights_only=False,
+    )
+    assert ckpt["wandb_run_id"] is None

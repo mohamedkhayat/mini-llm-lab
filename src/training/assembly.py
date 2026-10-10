@@ -109,6 +109,10 @@ def resolve_runtime(cfg, checkpoint) -> _Runtime:
     use_compile = bool(getattr(cfg.training, "compile", False))
     compile_mode = str(getattr(cfg.training, "compile_mode", "default"))
     _configure_cuda_features(device, use_bf16, use_tensor_cores)
+    # F8: pass the resolved truth downstream — on a non-CUDA device the
+    # loss path would otherwise enter a CUDA autocast (with warnings) on
+    # every call.
+    use_bf16 = use_bf16 and device.type == "cuda"
 
     if checkpoint is not None:
         resume_path = resolve_resume_path(cfg.training)

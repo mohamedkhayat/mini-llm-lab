@@ -9,6 +9,7 @@ recording logger, and a temp save directory. No GPU, no W&B, no corpora.
 """
 
 import json
+import warnings
 from pathlib import Path
 
 import pytest
@@ -380,6 +381,27 @@ def test_train_loss_is_the_interval_mean(make_trainer):
     assert len(logged) == 2
     assert logged[0] == pytest.approx((4.0 + 2.0 + 6.0 + 1.0) / 4)  # 3.25
     assert logged[1] == pytest.approx((2.0 + 8.0 + 6.0 + 4.0) / 4)  # 5.0
+
+
+def test_cpu_run_with_bf16_requested_enters_no_autocast(make_trainer):
+    """F8: use_bf16=true on a CPU device resolves to False in the
+    runtime — the loss path must never enter a CUDA autocast (which
+    warns on every call when CUDA is unavailable), so a full run stays
+    clean with that warning escalated to an error."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "error", message=".*CUDA is not available.*"
+        )
+        trainer, _ = make_trainer(
+            {
+                "use_bf16": True,
+                "eval_interval": 999,
+                "train_tokens": 3 * TOKENS_PER_STEP,
+            }
+        )
+        trainer.train()
+
+    assert trainer.state.step == 3
 
 
 def test_budget_larger_than_one_pass_is_rejected(make_trainer, tmp_path):

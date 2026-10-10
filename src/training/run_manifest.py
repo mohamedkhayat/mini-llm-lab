@@ -61,16 +61,21 @@ def make_entry(
     timestamp,
     wandb_run_id=None,
     wandb_url=None,
+    final_eval=None,
 ) -> dict:
     """Build one manifest entry for a checkpoint file.
 
     ``kind`` is one of ``latest`` / ``best`` / ``final`` / ``periodic``. A
     non-finite ``best_val_loss`` (no evaluation has improved yet) is recorded
     as ``None`` because it is not representable in strict JSON.
+
+    ``final_eval`` (F7) is an optional ``EvalResult`` recorded on the
+    final_model.pt entry as ``{"loss": ..., "tokens": ...}``; the key is
+    omitted entirely when it is None so older entries keep their shape.
     """
     if best_val_loss is None or not math.isfinite(best_val_loss):
         best_val_loss = None
-    return {
+    entry = {
         "file": file,
         "kind": kind,
         "step": int(step),
@@ -81,6 +86,9 @@ def make_entry(
         "wandb_run_id": wandb_run_id,
         "wandb_url": wandb_url,
     }
+    if final_eval is not None:
+        entry["final_eval"] = {"loss": final_eval.loss, "tokens": final_eval.tokens}
+    return entry
 
 
 def _load_existing_manifest(path: Path) -> dict:

@@ -91,20 +91,22 @@ class RunTracker:
             f"loss {snap.loss:.4f} | lr {snap.lr:.2e} | tok/s {snap.tok_per_sec:,.0f}"
         )
 
-    def log_evaluation(self, step, result) -> None:
-        """Log an ``EvalResult``; the terminal line is unchanged."""
+    def log_evaluation(self, step, result, prefix="val") -> None:
+        """Log an ``EvalResult`` under the ``<prefix>/`` metric namespace
+        (``val`` for periodic evals, ``final`` for the end-of-run scan,
+        F7); the terminal line is unchanged."""
         self.log_metrics(
             {
-                "val/loss": result.loss,
-                "val/ppl": result.ppl,
-                "val/stderr": result.stderr,
-                "val/tokens": result.tokens,
+                f"{prefix}/loss": result.loss,
+                f"{prefix}/ppl": result.ppl,
+                f"{prefix}/stderr": result.stderr,
+                f"{prefix}/tokens": result.tokens,
                 "step": step,
             },
             step,
         )
         if self._terminal:
-            print(f"eval | step {step} | val loss {result.loss:.4f}")
+            print(f"eval | step {step} | {prefix} loss {result.loss:.4f}")
 
     def log_sample(self, step, text, loss=None) -> None:
         self._logger.log_sample(text, step=step, loss=loss)
@@ -138,8 +140,11 @@ class RunTracker:
         )
 
     def record_checkpoint(self, kind, filename, *, step, tokens_seen, stage,
-                          best_val_loss, wandb_run_id) -> None:
-        """Update the local run manifest; failures never stop training."""
+                          best_val_loss, wandb_run_id, final_eval=None) -> None:
+        """Update the local run manifest; failures never stop training.
+
+        ``final_eval`` (F7) is the end-of-run ``EvalResult`` for the
+        final_model.pt entry only; it is an optional schema-free field."""
         try:
             wandb_url = self._logger.run_url
             entry = make_entry(
@@ -152,6 +157,7 @@ class RunTracker:
                 timestamp=utc_timestamp(),
                 wandb_run_id=wandb_run_id,
                 wandb_url=wandb_url,
+                final_eval=final_eval,
             )
             upsert_manifest(
                 self._save_dir,

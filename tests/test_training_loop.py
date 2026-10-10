@@ -95,9 +95,9 @@ def test_budget_stop_writes_final_and_latest_checkpoints(make_trainer):
     save_dir = Path(trainer.ckpt.save_dir)
     assert (save_dir / "latest.pt").is_file()
     assert (save_dir / "final_model.pt").is_file()
-    # The final full-scan eval always improves on the initial (inf) best,
-    # so it writes best.pt even with eval_interval disabled.
-    assert (save_dir / "best.pt").is_file()
+    # F7: the final eval no longer saves best.pt — with eval_interval
+    # disabled there is no periodic eval, so no best checkpoint at all.
+    assert not (save_dir / "best.pt").exists()
 
     final = logger.metric_batches[-1]
     assert final["run/progress"] == 1.0
@@ -255,8 +255,10 @@ def test_best_checkpoint_written_only_on_improvement_and_rewritten_later(make_tr
     save_dir = Path(trainer.ckpt.save_dir)
     assert (save_dir / "best.pt").is_file()
     val_losses = logger.logged("val/loss")
-    # 3 periodic evals (interval 4 over 12 steps) + the final full-scan eval.
-    assert len(val_losses) == 4
+    # 3 periodic evals (interval 4 over 12 steps). The final full-scan eval
+    # logs final/* and is not a val eval (F7).
+    assert len(val_losses) == 3
+    assert len(logger.logged("final/loss")) == 1
 
     improvements = 0
     best = float("inf")
@@ -290,8 +292,9 @@ def test_save_interval_writes_periodic_step_checkpoints_and_latest(make_trainer)
         assert (save_dir / name).is_file(), name
 
     # Periodic saves hit the manifest as "periodic" entries; only best/final
-    # checkpoints are uploaded as W&B artifacts — the final eval's best save
-    # and the final checkpoint are the ones the run's logger records.
+    # checkpoints are uploaded as W&B artifacts. With eval_interval disabled
+    # there is no periodic eval, and F7 removed the final eval's best save,
+    # so the final checkpoint is the only artifact the run records.
     manifest = json.loads((save_dir / "run_manifest.json").read_text())
     checkpoints = manifest["checkpoints"]
     assert checkpoints["step_4.pt"]["kind"] == "periodic"
@@ -300,7 +303,7 @@ def test_save_interval_writes_periodic_step_checkpoints_and_latest(make_trainer)
     assert checkpoints["step_8.pt"]["step"] == 8
     assert checkpoints["latest.pt"]["kind"] == "latest"
 
-    assert [c["kind"] for c in logger.checkpoints] == ["best", "final"]
+    assert [c["kind"] for c in logger.checkpoints] == ["final"]
 
     saved_step_4 = load_checkpoint(save_dir / "step_4.pt")
     assert saved_step_4["step"] == 4

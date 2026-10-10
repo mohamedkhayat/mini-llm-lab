@@ -21,10 +21,11 @@ class _RecordingTracker:
         self.artifacts = []    # (kind, name, metadata)
 
     def record_checkpoint(self, kind, filename, *, step, tokens_seen, stage,
-                          best_val_loss, wandb_run_id):
+                          best_val_loss, wandb_run_id, final_eval=None):
         self.records.append((kind, filename, dict(
             step=step, tokens_seen=tokens_seen, stage=stage,
             best_val_loss=best_val_loss, wandb_run_id=wandb_run_id,
+            final_eval=final_eval,
         )))
 
     def log_checkpoint_artifact(self, kind, name, path, metadata):

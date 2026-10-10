@@ -41,6 +41,12 @@ decay_tokens: null
 max_grad_norm: 1.0
 eval_interval: 200
 eval_batches: 50
+
+# Optional cap on the once-at-completion full-scan evaluation, in tokens
+# (plain integers or decimal suffixes such as 8m). Null = full scan of the
+# eval split. The cap trades precision for time on large eval splits;
+# it bounds the scan to tokens // (batch_size * seq_len) micro-batches.
+final_eval_max_tokens: null
 log_interval: 10
 # Write restart-complete checkpoints at this many optimizer steps. ``latest.pt``
 # is updated atomically; Ctrl-C/SIGTERM also writes it immediately after the

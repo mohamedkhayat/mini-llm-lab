@@ -62,7 +62,7 @@ class CheckpointManager:
         """Where checkpoints are written (inspection / test seam)."""
         return self._save_dir
 
-    def _record(self, state, kind: str, filename: str) -> None:
+    def _record(self, state, kind: str, filename: str, final_eval=None) -> None:
         self._tracker.record_checkpoint(
             kind,
             filename,
@@ -71,6 +71,7 @@ class CheckpointManager:
             stage=self._stage_label,
             best_val_loss=state.best_val_loss,
             wandb_run_id=state.wandb_run_id,
+            final_eval=final_eval,
         )
 
     def _artifact(self, kind: str, name: str, path: str) -> None:
@@ -81,11 +82,13 @@ class CheckpointManager:
         )
         self._tracker.log_checkpoint_artifact(kind, name, path, metadata)
 
-    def save(self, kind: str, state) -> None:
+    def save(self, kind: str, state, final_eval=None) -> None:
         """Persist one checkpoint event per the policy table row for
         ``kind``. ``state`` is the run's ``TrainState`` (its ``step`` names
         the periodic file; ``run_elapsed_seconds`` is stamped by the
-        ``before_save`` hook first)."""
+        ``before_save`` hook first). ``final_eval`` (F7) is the end-of-run
+        ``EvalResult``; for ``kind='final'`` it is recorded on the
+        final_model.pt manifest entry."""
         if self._before_save is not None:
             self._before_save()
         payload = self._snapshot_fn()
@@ -107,7 +110,7 @@ class CheckpointManager:
         elif kind == "final":
             self._write_primary("final_model.pt", payload)
             self._publish_latest("final_model.pt")
-            self._record(state, "final", "final_model.pt")
+            self._record(state, "final", "final_model.pt", final_eval=final_eval)
             self._record(state, "latest", "latest.pt")
             self._artifact("final", "final-model",
                            str(self._save_dir / "final_model.pt"))

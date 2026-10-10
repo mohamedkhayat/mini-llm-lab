@@ -24,6 +24,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+from data.budget import parse_token_budget
 from data.dataloader import MemmapDataLoader
 from data.prepare import get_data_dir
 from data.tokenizer import get_tokenizer
@@ -441,7 +442,25 @@ def build_evaluators(model, loss_fn, tokenizer, cfg, model_cfg, val_loader,
         num_batches=eval_batches,
         device=device,
     )
-    final_evaluator = Evaluator(model, loss_fn, val_loader, device=device)
+    # F7: optional cap on the final scan — tokens -> micro-batches
+    # (null = full scan; decimal suffixes like 8m are accepted).
+    final_cap = getattr(cfg.training, "final_eval_max_tokens", None)
+    final_num_batches = None
+    if final_cap is not None:
+        cap_tokens = parse_token_budget(
+            final_cap, "training.final_eval_max_tokens"
+        )
+        if cap_tokens is None:
+            raise ValueError(
+                "training.final_eval_max_tokens must be a token count "
+                f"(e.g. 512 or 8m); got {final_cap!r}"
+            )
+        final_num_batches = cap_tokens // (
+            int(cfg.training.batch_size) * int(cfg.data.seq_len)
+        )
+    final_evaluator = Evaluator(
+        model, loss_fn, val_loader, num_batches=final_num_batches, device=device
+    )
     gen_cfg = SimpleNamespace(
         start_context=str(cfg.training.start_context),
         max_new_tokens=int(cfg.training.max_new_tokens),

@@ -146,9 +146,13 @@ class Trainer:
         self._log_evaluation(self.evaluator.run())
 
     def _run_final_evaluation(self):
-        """Once at completion: a full scan of the eval split, logged
-        through the same path."""
-        self._log_evaluation(self.final_evaluator.run())
+        """Once at completion: a full scan (or capped budget) of the eval
+        split. F7: separate from best-tracking — logged under final/*,
+        no best comparison, no best save, no sample. Returns the result
+        so the final checkpoint's manifest entry can record it."""
+        result = self.final_evaluator.run()
+        self.tracker.log_evaluation(self.state.step, result, prefix="final")
+        return result
 
     def _handle_stop(self):
         """The unified stop path (SIGINT/SIGTERM/SIGHUP): checkpoint the
@@ -162,7 +166,7 @@ class Trainer:
     def _finish_run(self):
         """Run completion: final full-scan eval, closing run metrics, and
         the single final checkpoint event (spec #6)."""
-        self._run_final_evaluation()
+        final_result = self._run_final_evaluation()
         self.state.run_elapsed_seconds = self.clock.elapsed()
         self.tracker.log_finished(
             ProgressSnapshot(
@@ -180,7 +184,7 @@ class Trainer:
                 gpu_metrics={},
             )
         )
-        self.ckpt.save("final", self.state)
+        self.ckpt.save("final", self.state, final_eval=final_result)
 
     def train(self):
         """The outer training loop (the seven semantics of spec 5.12)."""

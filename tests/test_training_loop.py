@@ -355,6 +355,30 @@ def test_gradient_accumulation_steps_once_per_micro_batch_group(make_trainer):
     assert len(logger.logged("train/loss")) == 4
 
 
+def test_train_loss_is_the_interval_mean(make_trainer):
+    """F6: the logged train/loss is the arithmetic mean over the log
+    interval (add() every step, mean_and_reset at log steps) — not a
+    single-step sample."""
+    import torch
+
+    trainer, logger = make_trainer(
+        {"log_interval": 4, "eval_interval": 999, "train_tokens": 8 * TOKENS_PER_STEP}
+    )
+    known = [4.0, 2.0, 6.0, 1.0, 2.0, 8.0, 6.0, 4.0]
+    it = iter(known)
+
+    def stub_train_step(micro_batches):
+        return torch.tensor(next(it)), torch.tensor(1.0)
+
+    trainer.train_step = stub_train_step
+    trainer.train()
+
+    logged = logger.logged("train/loss")
+    assert len(logged) == 2
+    assert logged[0] == pytest.approx((4.0 + 2.0 + 6.0 + 1.0) / 4)  # 3.25
+    assert logged[1] == pytest.approx((2.0 + 8.0 + 6.0 + 4.0) / 4)  # 5.0
+
+
 def test_budget_larger_than_one_pass_is_rejected(make_trainer, tmp_path):
     """The trainer does not rescan the data: a budget beyond the file's
     capacity (62 steps for the tiny cache) raises BEFORE the trainer is

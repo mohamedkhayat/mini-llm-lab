@@ -49,6 +49,14 @@ def test_loss_accumulator_mean_and_reset():
     assert acc.mean_and_reset() == pytest.approx(2.0)
 
 
+def test_loss_accumulator_mean_and_reset_empty_buffer_raises():
+    """F6: reading the mean with no pending step is a loop bug; fail
+    with a clear error instead of a nan/empty-stack surprise."""
+    acc = LossAccumulator()
+    with pytest.raises(RuntimeError, match="no pending"):
+        acc.mean_and_reset()
+
+
 def test_loss_accumulator_holds_detached_tensors():
     """add() stashes a detached view: no grad graph is retained."""
     acc = LossAccumulator()

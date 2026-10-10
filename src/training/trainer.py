@@ -223,9 +223,14 @@ class Trainer:
                     self.state.step += 1
                     self.state.tokens_seen += self.budget.tokens_per_step
 
-                    # #3: one sync per log interval.
+                    # #3: one sync per log interval. add() stashes the
+                    # detached loss (no host sync) every step; at log
+                    # steps mean_and_reset() is the loop's single
+                    # .item(), reading the mean over the interval.
+                    # (After a resume mid-interval the first logged mean
+                    # covers fewer steps than the full interval.)
+                    self.loss_accum.add(loss)
                     if self.state.step % self.intervals.log_interval == 0:
-                        self.loss_accum.add(loss)
                         self._log_progress(grad_norm.item())
                     # #4: periodic evaluation + best checkpoint.
                     if self.state.step % self.intervals.eval_interval == 0:

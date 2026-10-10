@@ -90,6 +90,12 @@ class LossAccumulator:
         self._values.append(loss.detach())
 
     def mean_and_reset(self) -> float:
+        if not self._values:
+            raise RuntimeError(
+                "LossAccumulator.mean_and_reset with no pending steps; "
+                "add() runs every optimizer step, so this means the mean "
+                "was read before any step completed."
+            )
         mean = torch.stack(self._values).mean()
         self._values.clear()
         return float(mean.item())

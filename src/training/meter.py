@@ -23,6 +23,14 @@ class RunClock:
         self._elapsed_before = float(elapsed_before)
         self._start = time.perf_counter()
 
+    def restart(self, elapsed_before: float) -> None:
+        """Restart the wall-clock window at ``elapsed_before`` (F9): time
+        spent before the call — assembly, W&B init, compile — is not run
+        time. The clock is shared (trainer loop + checkpoint before_save),
+        so it is reset in place."""
+        self._elapsed_before = float(elapsed_before)
+        self._start = time.perf_counter()
+
     def elapsed(self) -> float:
         return self._elapsed_before + (time.perf_counter() - self._start)
 

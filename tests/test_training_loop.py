@@ -9,6 +9,7 @@ recording logger, and a temp save directory. No GPU, no W&B, no corpora.
 """
 
 import json
+import time
 import warnings
 from pathlib import Path
 
@@ -381,6 +382,18 @@ def test_train_loss_is_the_interval_mean(make_trainer):
     assert len(logged) == 2
     assert logged[0] == pytest.approx((4.0 + 2.0 + 6.0 + 1.0) / 4)  # 3.25
     assert logged[1] == pytest.approx((2.0 + 8.0 + 6.0 + 4.0) / 4)  # 5.0
+
+
+def test_run_elapsed_seconds_excludes_time_before_train(make_trainer):
+    """F9: the run clock restarts in train() — the wall time spent in
+    assembly (W&B init, compile) is not counted as run time."""
+    trainer, _ = make_trainer(
+        {"eval_interval": 999, "train_tokens": 2 * TOKENS_PER_STEP}
+    )
+    time.sleep(2.0)  # this sleep must not count toward run time
+    trainer.train()
+
+    assert trainer.state.run_elapsed_seconds < 1.5
 
 
 def test_cpu_run_with_bf16_requested_enters_no_autocast(make_trainer):

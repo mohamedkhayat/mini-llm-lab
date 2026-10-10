@@ -62,13 +62,21 @@ def _launch_directory() -> Path:
         return Path.cwd()
 
 
+def resume_requested(training_cfg) -> bool:
+    """Whether the run was asked to resume. One shared predicate (F9):
+    ``None``, ``''`` and ``False`` all mean not requested. Used by both
+    ``build_trainer`` (refuse a fresh run when a resume was asked) and
+    ``resolve_resume_path``."""
+    configured = getattr(training_cfg, "resume_from", None)
+    return configured not in (None, "", False)
+
+
 def resolve_resume_path(training_cfg) -> Path | None:
     """Resolve an explicit checkpoint path or the newest ``latest.pt``."""
-    configured_path = getattr(training_cfg, "resume_from", None)
-    if configured_path in (None, "", False):
+    if not resume_requested(training_cfg):
         return None
 
-    configured_path = str(configured_path)
+    configured_path = str(getattr(training_cfg, "resume_from", None))
     root = _launch_directory()
     if configured_path.lower() in {"latest", "auto"}:
         candidates = list(root.rglob("latest.pt"))

@@ -188,6 +188,10 @@ class Trainer:
 
     def train(self):
         """The outer training loop (the seven semantics of spec 5.12)."""
+        # F9: the run clock starts HERE — W&B init and compile time (spent
+        # in assembly) are not counted as run time. The same clock object
+        # is shared with the checkpoint before_save hook, so reset in place.
+        self.clock.restart(self.state.run_elapsed_seconds)
         self.model.train()
         self.meter.start(self.state.tokens_seen)
         self.loss_accum = LossAccumulator()

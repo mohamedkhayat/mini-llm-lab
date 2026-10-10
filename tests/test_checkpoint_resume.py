@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 
+from conftest import TOKENS_PER_STEP
 from data.dataloader import MemmapDataLoader
 from training.checkpointing import (
     atomic_torch_save,
@@ -129,6 +130,21 @@ def test_check_resume_consistency_rejects_a_missing_steps_per_pass():
             tokens_per_step=16,
             decay_run=False,
         )
+
+
+def test_empty_resume_from_with_no_checkpoint_is_a_fresh_run(make_trainer):
+    """F9: resume_from in {None, '', False} means not requested — an
+    empty string with no checkpoint builds a fresh run instead of
+    raising (one shared predicate: resume_requested)."""
+    trainer, _ = make_trainer(
+        {
+            "resume_from": "",
+            "eval_interval": 999,
+            "train_tokens": 3 * TOKENS_PER_STEP,
+        }
+    )
+    trainer.train()
+    assert trainer.state.step == 3
 
 
 def test_restore_training_state_round_trip(tmp_path):

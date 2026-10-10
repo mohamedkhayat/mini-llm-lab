@@ -33,6 +33,7 @@ from training.ckpt_manager import CheckpointManager, RunIdentity
 from training.checkpointing import (
     build_checkpoint_payload,
     capture_data_state,
+    resume_requested,
     resolve_resume_path,
     restore_data_state,
     restore_model,
@@ -661,12 +662,14 @@ def build_trainer(cfg, checkpoint=None, *, logger=None) -> Trainer:
     P3) if the budget cannot fit one pass over the data or the resume
     geometry is inconsistent.
     """
-    resume_from = getattr(cfg.training, "resume_from", None)
-    if resume_from is not None and checkpoint is None:
+    # F9: None / '' / False all mean not requested (shared predicate).
+    if resume_requested(cfg.training) and checkpoint is None:
         raise ValueError(
-            f"training.resume_from is set ({resume_from!r}) but no checkpoint "
-            "was loaded; refusing to silently start a fresh run. Load the "
-            "checkpoint (train.py does this) and pass it to build_trainer."
+            f"training.resume_from is set "
+            f"({getattr(cfg.training, 'resume_from', None)!r}) but no "
+            "checkpoint was loaded; refusing to silently start a fresh run. "
+            "Load the checkpoint (train.py does this) and pass it to "
+            "build_trainer."
         )
 
     # 1. runtime (seed/device/cuda/save_dir) — no W&B side effects yet.

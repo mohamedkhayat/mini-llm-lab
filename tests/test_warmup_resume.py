@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 
 from conftest import TOKENS_PER_STEP
+from data.dataloader import MemmapDataLoader
 from training.checkpointing import load_checkpoint
 from training.assembly import build_trainer
 
@@ -112,8 +113,65 @@ def test_phase_budget_carries_warmup_steps_in_as_dict():
         warmup_steps=5,
     )
     assert budget.as_dict()["warmup_steps"] == 5
-    # The default (resumes, decay runs, fresh runs before resolution) is 0.
+    # F9: the default is the None sentinel (resumes, decay runs, fresh
+    # runs before resolution); resolve_budget fills it for fresh stable
+    # starts and as_dict persists None as null.
     assert PhaseBudget(
         mode="one_pass", stage="stable", start_step=0, target_step=None,
         requested_tokens=None, effective_tokens=None,
-    ).warmup_steps == 0
+    ).warmup_steps is None
+
+
+def test_one_pass_resume_uses_the_persisted_warmup_steps(
+    tiny_cfg, tmp_path, capsys, monkeypatch
+):
+    """F9: a one-pass checkpoint (wsd target_step None) carries its
+    resolved warmup_steps; resuming after a warmup_fraction edit must
+    keep the original LR curve (pre-F9 the exact_resume branch rebuilt
+    the budget with warmup 0 and resolve_budget refilled it from the
+    NEW config's fraction)."""
+    tiny_cfg.training.train_tokens = None  # one-pass budget
+    tiny_cfg.training.warmup_fraction = 0.5
+    tiny_cfg.training.save_interval = 2
+    tiny_cfg.training.log_interval = 1
+
+    reference = build_trainer(tiny_cfg)
+    reference.train()
+    original = _lrs(capsys.readouterr().out)
+    assert len(original) == 62, "the tiny cache is 62 optimizer steps"
+
+    # First leg: stop after step 2 (the trip lands inside step 3's pull).
+    trainer_box = {}
+    pulled = [0]
+    real_iter = MemmapDataLoader.__iter__
+
+    def counting_iter(loader):
+        for batch in real_iter(loader):
+            pulled[0] += 1
+            yield batch
+            if pulled[0] == 4:
+                trainer_box["trainer"].shutdown.stop.requested = True
+
+    monkeypatch.setattr(MemmapDataLoader, "__iter__", counting_iter)
+    leg1 = build_trainer(tiny_cfg)
+    trainer_box["trainer"] = leg1
+    leg1.train()
+    monkeypatch.setattr(MemmapDataLoader, "__iter__", real_iter)
+    assert leg1.state.step == 2
+    latest = glob.glob(str(tmp_path / "**" / "latest.pt"), recursive=True)
+    assert latest, "the stop checkpoint must exist"
+
+    # Relaunch with a different warmup fraction: the persisted warmup
+    # (int(0.5 * 62) = 31) must win over the new fraction (0.2 -> 12).
+    tiny_cfg.training.warmup_fraction = 0.2
+    tiny_cfg.training.save_interval = None
+    resumed = build_trainer(
+        tiny_cfg, checkpoint=load_checkpoint(Path(latest[0]))
+    )
+    resumed.train()
+    resumed_lrs = _lrs(capsys.readouterr().out)
+
+    for step in range(3, 63):
+        assert resumed_lrs[step] == original[step], (
+            f"step {step}: the resumed LR must keep the original ramp"
+        )

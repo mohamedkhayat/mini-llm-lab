@@ -36,12 +36,16 @@ class PhaseBudget:
     effective_tokens: int | None
     decay_start_step: int | None = None
     decay_steps: int | None = None
-    # Computed once at budget resolution and persisted so the LR curve is
-    # independent of later config edits (0 for resumes and decay runs).
-    warmup_steps: int = 0
+    # F9: None is the "unresolved" sentinel. resolve_budget fills it for a
+    # fresh stable start (from warmup_fraction) and the exact_resume branch
+    # fills it from the saved wsd entry; explicit values (including 0) are
+    # respected. as_dict persists None as null; consumers treat a restored
+    # None as 0.
+    warmup_steps: int | None = None
 
     def as_dict(self) -> dict:
-        """Return the checkpoint/logging representation."""
+        """Return the checkpoint/logging representation (None warmup
+        persists as null)."""
         return {
             "mode": self.mode,
             "stage": self.stage,
@@ -133,7 +137,9 @@ def _saved_phase_budget(
                 if decay_steps is not None
                 else target_step - decay_start
             )
-        if "warmup_steps" in saved_wsd:
+        # F9: an explicit null (the unresolved sentinel persisted by
+        # as_dict) counts as absent and falls back to the historical rule.
+        if saved_wsd.get("warmup_steps") is not None:
             warmup_steps = int(saved_wsd["warmup_steps"])
         else:
             # Old-format checkpoint: the historical rule — warmup only on a
@@ -260,6 +266,22 @@ def resolve_phase_budget(training_cfg, checkpoint, tokens_per_step: int) -> Phas
         saved_total = checkpoint.get("total_steps")
         if saved_total is not None:
             saved_total = int(saved_total)
+            # F9: this branch is the one-pass default (the saved phase had
+            # target_step None), so use the PERSISTED warmup — the LR curve
+            # must survive later warmup_fraction edits. An absent key
+            # (old-format checkpoint) falls back to the historical rule:
+            # fresh stable start -> fraction * total.
+            saved_wsd = checkpoint.get("wsd")
+            if not isinstance(saved_wsd, dict):
+                saved_wsd = {}
+            saved_warmup = saved_wsd.get("warmup_steps")
+            if saved_warmup is not None:
+                warmup_steps = int(saved_warmup)
+            else:
+                warmup_steps = int(
+                    float(getattr(training_cfg, "warmup_fraction", 0.0))
+                    * saved_total
+                )
             return PhaseBudget(
                 mode="exact_resume",
                 stage="stable",
@@ -267,6 +289,7 @@ def resolve_phase_budget(training_cfg, checkpoint, tokens_per_step: int) -> Phas
                 target_step=saved_total,
                 requested_tokens=saved_total * tokens_per_step,
                 effective_tokens=saved_total * tokens_per_step,
+                warmup_steps=warmup_steps,
             )
 
     train_tokens = getattr(training_cfg, "train_tokens", None)
@@ -301,8 +324,8 @@ def build_lr_lambda(warmup_steps, peak_lr, min_lr, phase: PhaseBudget):
     """Linear warmup, then — for a decay phase — a cosine decay from
     ``phase.decay_start_step`` over ``phase.decay_steps`` down to min_lr.
     Reads the phase directly (no wsd-state dict, no ``triggered``/``step``
-    aliases)."""
-    warmup_steps = int(warmup_steps)
+    aliases). A None warmup (the unresolved sentinel, F9) means no warmup."""
+    warmup_steps = int(warmup_steps if warmup_steps is not None else 0)
     peak_lr = float(peak_lr)
     min_lr = float(min_lr)
 
@@ -399,10 +422,13 @@ def resolve_budget(
     )
     budget_name = _BUDGET_NAMES.get(phase.mode, phase.mode)
 
+    # F9: fill the sentinel only — an explicit value (including 0) is
+    # respected; phases that keep None (decay, continuations) persist null
+    # and resume as warmup 0.
     if (
         phase.stage == "stable"
         and phase.start_step == 0
-        and phase.warmup_steps == 0
+        and phase.warmup_steps is None
     ):
         phase = replace(
             phase,

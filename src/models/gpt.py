@@ -25,7 +25,12 @@ class GptModel(nn.Module):
         self.final_norm = get_norm(getattr(cfg, "normalization", "layer_norm"))(
             cfg.emb_dim
         )
-        self.lm_head = nn.Linear(cfg.emb_dim, cfg.vocab_size, bias=False)
+        # F4: the key's absence defaults to no bias (current behavior);
+        # build_model infers the key from the checkpoint's tensors when a
+        # saved model_cfg predates it.
+        self.lm_head = nn.Linear(
+            cfg.emb_dim, cfg.vocab_size, bias=bool(getattr(cfg, "lm_head_bias", False))
+        )
         
         self.tie_embeddings = bool(getattr(cfg, "tie_embeddings", False))
         if self.tie_embeddings:

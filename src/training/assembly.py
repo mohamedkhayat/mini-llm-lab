@@ -196,6 +196,16 @@ def build_model(cfg, checkpoint, runtime: _Runtime):
                 saved_model_cfg = saved_cfg.get("model")
         if saved_model_cfg is not None:
             model_cfg = OmegaConf.create(saved_model_cfg)
+        # F4: a saved model_cfg without the lm_head_bias key cannot decide
+        # the architecture — checkpoints written after the bias removal
+        # but before the key existed have no key AND no bias tensor. The
+        # checkpoint's tensors are the source of truth.
+        if "lm_head_bias" not in model_cfg:
+            state = checkpoint.get("model") or {}
+            has_bias = any(
+                key.removeprefix("_orig_mod.") == "lm_head.bias" for key in state
+            )
+            model_cfg = OmegaConf.merge(model_cfg, {"lm_head_bias": has_bias})
 
     # TODO: replace with a factory that dispatches on cfg.model.name
     # (gpt2/moe/qwen)

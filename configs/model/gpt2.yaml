@@ -1,6 +1,7 @@
 name: gpt2
 attention: mha
 tie_embeddings: true
+lm_head_bias: false
 vocab_size: 50257
 context_length: 1024
 emb_dim: 768

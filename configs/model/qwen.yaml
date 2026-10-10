@@ -1,6 +1,7 @@
 name: qwen
 attention: mha
 tie_embeddings: true
+lm_head_bias: false
 vocab_size: 152064
 context_length: 4096
 emb_dim: 896

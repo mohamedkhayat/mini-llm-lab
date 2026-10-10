@@ -12,9 +12,10 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 from conftest import TOKENS_PER_STEP
-from training.checkpointing import load_checkpoint
+from training.checkpointing import check_cursor_consistency, load_checkpoint
 
 
 class StoppingLoader:
@@ -127,6 +128,94 @@ def test_stop_flag_between_steps_writes_latest_and_logs_the_interrupt(make_train
     assert last["run/interrupted"] == 1
     assert last["run/steps_remaining"] == 6
     assert logger.finished is True
+
+
+def test_stop_mid_pull_keeps_the_cursor_consistent_with_the_step(make_trainer):
+    """F2: a stop requested during a pull discards the pulled micro-batches
+    and must restore the data cursor to its pre-pull position, so the
+    checkpoint's cursor equals (step - start_step) * accum_steps + the
+    phase's start cursor."""
+    trainer, logger = make_trainer(
+        {"eval_interval": 999, "train_tokens": 10 * TOKENS_PER_STEP}
+    )
+    trainer.train_loader = StoppingLoader(
+        trainer.train_loader, trainer, trip_after=8  # trips inside a pull
+    )
+
+    trainer.train()
+
+    assert trainer.state.step == 4
+    # The discarded pull must not count: the cursor sits exactly at
+    # step * accum_steps (4 x 2 = 8, not 10).
+    assert trainer.train_loader.current_step == 8
+    saved = load_checkpoint(Path(trainer.ckpt.save_dir) / "latest.pt")
+    assert saved["data_state"] == {
+        "kind": "memmap",
+        "state": {"current_step": 8},
+    }
+    check_cursor_consistency(
+        trainer.state, trainer.train_loader, trainer.accum_steps,
+        trainer.budget.phase,
+    )
+
+
+def test_stop_mid_pull_then_resume_matches_uninterrupted_run(make_trainer):
+    """F2 resume-equivalence: a stop injected mid-pull checkpoints the
+    pre-pull cursor; resuming from it must consume exactly the remaining
+    data and end with weights identical to an uninterrupted run of the
+    same budget (no skipped or duplicated micro-batches)."""
+    reference, _ = make_trainer(
+        {"eval_interval": 999, "train_tokens": 10 * TOKENS_PER_STEP}
+    )
+    reference.train()
+
+    trainer, _ = make_trainer(
+        {"eval_interval": 999, "train_tokens": 10 * TOKENS_PER_STEP}
+    )
+    trainer.train_loader = StoppingLoader(
+        trainer.train_loader, trainer, trip_after=8
+    )
+    trainer.train()
+    assert trainer.state.step == 4
+
+    checkpoint = load_checkpoint(Path(trainer.ckpt.save_dir) / "latest.pt")
+    resumed, _ = make_trainer(
+        {"eval_interval": 999, "train_tokens": 10 * TOKENS_PER_STEP},
+        checkpoint=checkpoint,
+    )
+    resumed.train()
+
+    reference_state = reference.model.state_dict()
+    resumed_state = resumed.model.state_dict()
+    for key in reference_state:
+        torch.testing.assert_close(
+            resumed_state[key], reference_state[key], atol=0, rtol=0
+        )
+
+
+def test_stop_mid_pull_then_resume_exhausts_the_file_without_ran_out(
+    make_trainer
+):
+    """F2: a one-pass budget that fills the file exactly (62 steps x 2
+    micro-batches = 124 = the whole tiny train file). Pre-F2 the
+    discarded pull skipped 2 batches, so the resumed run hit
+    'Ran out of data' before the budget was reached."""
+    trainer, _ = make_trainer(
+        {"eval_interval": 999, "train_tokens": 62 * TOKENS_PER_STEP}
+    )
+    trainer.train_loader = StoppingLoader(
+        trainer.train_loader, trainer, trip_after=8
+    )
+    trainer.train()
+    assert trainer.state.step == 4
+
+    checkpoint = load_checkpoint(Path(trainer.ckpt.save_dir) / "latest.pt")
+    resumed, _ = make_trainer(
+        {"eval_interval": 999, "train_tokens": 62 * TOKENS_PER_STEP},
+        checkpoint=checkpoint,
+    )
+    resumed.train()
+    assert resumed.state.step == 62
 
 
 def test_keyboard_interrupt_from_the_iterator_propagates(make_trainer):

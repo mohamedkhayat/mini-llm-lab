@@ -247,6 +247,26 @@ def check_resume_consistency(
         )
 
 
+def check_cursor_consistency(state, loader, accum_steps, phase) -> None:
+    """Test-only invariant (never called from production code): at every
+    checkpoint save the data cursor must equal the phase's start cursor
+    plus ``(state.step - phase.start_step) * accum_steps`` — a stop or
+    crash may never leave the cursor ahead of (or behind) the completed
+    steps, or a resume would skip or duplicate data."""
+    accum_steps = int(accum_steps)
+    start_step = int(phase.start_step)
+    start_cursor = start_step * accum_steps
+    expected = start_cursor + (int(state.step) - start_step) * accum_steps
+    actual = int(loader.state_dict()["current_step"])
+    if actual != expected:
+        raise AssertionError(
+            f"Data cursor {actual} is inconsistent with step {state.step}: "
+            f"expected {expected} (start cursor {start_cursor}, "
+            f"{accum_steps} micro-batches per step). A discarded pull must "
+            f"not advance the cursor."
+        )
+
+
 def restore_model(model, checkpoint) -> None:
     """Load plain or compiled-module state into the uncompiled model.
 

@@ -122,15 +122,15 @@ def test_stop_never_mid_accumulation(tiny_cfg, monkeypatch):
     assert ckpt["step"] == 1
     assert not (Path(trainer.ckpt.save_dir) / "final_model.pt").exists()
 
-    # The checkpoint's data cursor sits on a group boundary (two complete
-    # micro-batch groups), never mid-accumulation: resume restores the step
-    # and the cursor exactly. (The pulled-but-untrained group is lost —
-    # single pass, no rescan — so running the resumed run to its budget is
-    # a data-budget question, not a checkpoint-consistency question.)
+    # The checkpoint's data cursor sits on a group boundary (one complete
+    # micro-batch group), never mid-accumulation: F2 restored the cursor
+    # to its pre-pull position when group 2 was discarded, so resume
+    # restores the step and the cursor exactly and the pulled-but-
+    # untrained group is NOT lost — it will be consumed again on resume.
     import copy
 
     cfg2 = copy.deepcopy(tiny_cfg)
     cfg2.training.resume_from = str(Path(trainer.ckpt.save_dir) / "latest.pt")
     resumed = build_trainer(cfg2, checkpoint=ckpt)
     assert resumed.state.step == 1
-    assert resumed.train_loader.current_step == 4
+    assert resumed.train_loader.current_step == 2

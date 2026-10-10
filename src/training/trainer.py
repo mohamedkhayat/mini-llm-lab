@@ -7,7 +7,9 @@ built once in assembly before the loop starts.
 """
 
 from dataclasses import dataclass
+from typing import cast
 
+import torch
 from torch.nn.utils import clip_grad_norm_
 
 from training.meter import LossAccumulator, gpu_memory_metrics
@@ -100,7 +102,9 @@ class Trainer:
         grad_norm = clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         self.optimizer.step()
         self.scheduler.step()
-        return total, grad_norm
+        # total is a Tensor here: the pull loop always supplies at least
+        # one micro-batch, so the first += replaces the 0.0 seed.
+        return cast("torch.Tensor", total), grad_norm
 
     def _log_progress(self, grad_norm):
         # The single .item() on the log path (the interval mean from the
@@ -192,8 +196,13 @@ class Trainer:
                     and not stop.requested
                 ):
                     # #1: pull one group of micro-batches. A stop requested
-                    # between pulls is honored before the step, so a
-                    # checkpoint never lands mid-accumulation.
+                    # during the pull is honored before the step: the pulled
+                    # micro-batches are discarded and the data cursor is
+                    # restored to its pre-pull position, so the stop
+                    # checkpoint's cursor never lands ahead of state.step
+                    # (a resume would otherwise skip data, and a one-pass
+                    # run could end with 'Ran out of data').
+                    cursor = self.train_loader.state_dict()
                     micro_batches = []
                     for _ in range(self.accum_steps):
                         try:
@@ -206,6 +215,7 @@ class Trainer:
                                 "larger than one pass over the data."
                             )
                     if stop.requested:
+                        self.train_loader.load_state_dict(cursor)
                         break
 
                     # #2: one optimizer step, no host sync.

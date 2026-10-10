@@ -11,8 +11,12 @@ Single write per event: for ``periodic`` and ``final`` the payload is
 serialized once to the primary file, then ``latest.pt`` is published by
 hardlinking the primary's inode to a temp name and ``os.replace``-ing it
 over ``latest.pt`` (falling back to a streamed copy when ``os.link``
-fails — cross-device or a filesystem without hardlinks). Primary files
-are write-once, so a shared inode is safe.
+fails — cross-device or a filesystem without hardlinks).
+
+Every published file is written atomically (temp inode + ``os.replace``)
+and is only ever replaced, never modified in place — so a crash mid-save
+cannot truncate a resumable file, and a later ``latest.pt`` replace can
+never corrupt a shared-inode primary.
 
 ``snapshot_fn() -> dict`` is supplied by the trainer (until T6.2 moves it
 to assembly) and returns the full payload via
@@ -27,6 +31,9 @@ from pathlib import Path
 from typing import Callable, NamedTuple
 
 import torch
+
+from training.checkpointing import atomic_torch_save
+from training.run_manifest import fsync_dir
 
 
 class RunIdentity(NamedTuple):
@@ -108,19 +115,23 @@ class CheckpointManager:
             raise ValueError(f"unknown checkpoint kind: {kind!r}")
 
     def _write_primary(self, filename: str, payload) -> None:
-        """Serialize the payload exactly once to the primary file."""
-        path = self._save_dir / filename
-        # torch.save is called here — the single serialization of the event.
-        with open(path, "wb") as handle:
-            torch.save(payload, handle)
+        """Serialize the payload exactly once to the primary file,
+        atomically: temp inode + ``os.replace``, so a crash mid-write can
+        never truncate a published file."""
+        atomic_torch_save(payload, self._save_dir / filename)
 
     def _publish_latest(self, primary_name: str) -> None:
         """Publish ``latest.pt`` without re-serializing: hardlink the
         primary's inode to a temp name, then atomically rename over
-        ``latest.pt``; fall back to a streamed copy if ``os.link`` fails."""
+        ``latest.pt``; fall back to a streamed copy if ``os.link`` fails.
+
+        The temp is unlinked (missing_ok) BEFORE the link so a stale
+        temp — possibly hardlinked to a primary — can never be opened
+        with 'wb' by the copy fallback and truncate that primary."""
         primary = self._save_dir / primary_name
         latest = self._save_dir / "latest.pt"
-        tmp = self._save_dir / f"latest.pt.{id(self) % 10_000_000}.tmp"
+        tmp = self._save_dir / f".latest.pt.tmp.{os.getpid()}"
+        tmp.unlink(missing_ok=True)
         try:
             try:
                 os.link(primary, tmp)
@@ -128,6 +139,7 @@ class CheckpointManager:
                 with open(primary, "rb") as src, open(tmp, "wb") as dst:
                     shutil.copyfileobj(src, dst, length=1024 * 1024)
             tmp.replace(latest)
+            fsync_dir(self._save_dir)
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise

@@ -95,6 +95,17 @@ def _load_existing_manifest(path: Path) -> dict:
     return manifest
 
 
+def fsync_dir(path) -> None:
+    """fsync a directory so a rename/replace survives a power loss even
+    after the file contents have already reached disk."""
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(Path(path), directory_flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def atomic_write(destination, writer) -> None:
     """Write via ``writer(file)`` to a temp file + atomic rename.
 
@@ -113,15 +124,7 @@ def atomic_write(destination, writer) -> None:
             file.flush()
             os.fsync(file.fileno())
         os.replace(temporary, destination)
-
-        # fsync the parent directory so a sudden power loss cannot lose the
-        # rename even after the file contents have reached disk.
-        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        directory_fd = os.open(destination.parent, directory_flags)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        fsync_dir(destination.parent)
     finally:
         if temporary.exists():
             temporary.unlink()

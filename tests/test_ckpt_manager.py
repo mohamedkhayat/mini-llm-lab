@@ -1,5 +1,6 @@
 """T4.1: CheckpointManager — the single home of the save policy table."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,10 @@ import pytest
 import torch
 
 from training.ckpt_manager import CheckpointManager, RunIdentity
+
+
+def _sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 class _RecordingTracker:
@@ -149,6 +154,90 @@ def test_before_save_runs_before_the_snapshot(tmp_path):
     assert order.index("before_save") < order.index("snapshot")
     payload = torch.load(tmp_path / "latest.pt", weights_only=True)
     assert payload == {"t": 123.0}
+
+
+def test_save_latest_does_not_mutate_a_previous_primary(tmp_path):
+    """A published file is never modified in place: republishing latest.pt
+    (which after a periodic save may share an inode with the primary)
+    must leave the primary's bytes untouched."""
+    tracker = _RecordingTracker()
+    state = _state(step=7)
+    mgr = _make_manager(tmp_path, tracker, state)
+    mgr.save("periodic", state)
+    before = _sha(tmp_path / "step_7.pt")
+
+    state.step = 9
+    mgr.save("latest", state)
+
+    assert _sha(tmp_path / "step_7.pt") == before
+    assert torch.load(tmp_path / "latest.pt", weights_only=True)["step"] == 9
+
+
+def test_failed_save_leaves_previous_latest_intact(tmp_path, monkeypatch):
+    """A crash mid-write must not truncate latest.pt: the previous file
+    stays readable and no temp files remain."""
+    tracker = _RecordingTracker()
+    state = _state(step=1)
+    mgr = _make_manager(tmp_path, tracker, state)
+    mgr.save("latest", state)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated crash mid-save")
+
+    monkeypatch.setattr(torch, "save", boom)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        mgr.save("latest", state)
+
+    assert torch.load(tmp_path / "latest.pt", weights_only=True)["step"] == 1
+    leftovers = [p.name for p in tmp_path.iterdir() if ".tmp" in p.name]
+    assert leftovers == []
+
+
+def test_stale_publish_temp_is_removed_and_primaries_untouched(tmp_path):
+    """A stale ``.latest.pt.tmp.<pid>`` hardlinked to a previous primary
+    must be unlinked before the publish, or the copy fallback would open
+    it with 'wb' and truncate the primary."""
+    tracker = _RecordingTracker()
+    state = _state(step=3)
+    mgr = _make_manager(tmp_path, tracker, state)
+    mgr.save("periodic", state)
+    primary_bytes = (tmp_path / "step_3.pt").read_bytes()
+
+    stale = tmp_path / f".latest.pt.tmp.{os.getpid()}"
+    os.link(tmp_path / "step_3.pt", stale)
+
+    state.step = 6
+    mgr.save("periodic", state)
+
+    assert not stale.exists()
+    assert (tmp_path / "step_3.pt").read_bytes() == primary_bytes
+    assert (tmp_path / "step_6.pt").read_bytes() == (
+        tmp_path / "latest.pt"
+    ).read_bytes()
+
+
+def test_copy_fallback_publishes_equal_content_with_a_different_inode(
+    tmp_path, monkeypatch
+):
+    """With hardlinks unavailable the copy fallback still publishes
+    equal-content latest.pt — on a fresh inode, never on the primary's."""
+
+    def boom(*args, **kwargs):
+        raise OSError("no hardlinks on this filesystem")
+
+    monkeypatch.setattr(os, "link", boom)
+
+    tracker = _RecordingTracker()
+    state = _state(step=4)
+    mgr = _make_manager(tmp_path, tracker, state)
+    mgr.save("periodic", state)
+
+    latest = tmp_path / "latest.pt"
+    primary = tmp_path / "step_4.pt"
+    assert latest.read_bytes() == primary.read_bytes()
+    assert os.stat(latest).st_ino != os.stat(primary).st_ino
+    assert [p.name for p in tmp_path.iterdir() if ".tmp" in p.name] == []
 
 
 def test_manifest_written_through_upsert(tmp_path):

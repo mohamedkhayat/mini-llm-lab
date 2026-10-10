@@ -97,12 +97,3 @@ def test_memmap_resume_is_silent(capsys):
     assert loader.current_step == 4
 
 
-def test_legacy_checkpoint_without_wsd_key_is_tolerated_on_resume():
-    # Loaders tolerate the absence of the wsd state: a checkpoint saved
-    # before this feature simply has no "wsd" key.
-    from training.schedule import resolve_wsd_state
-
-    assert resolve_wsd_state(None, start_decay=False, resume_step=30) == {
-        "triggered": False,
-        "step": None,
-    }

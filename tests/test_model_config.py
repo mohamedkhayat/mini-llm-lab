@@ -34,14 +34,14 @@ def test_tied_embeddings_are_enabled_explicitly():
     model = GptModel(make_model_config(tie_embeddings=True))
 
     assert model.tie_embeddings is True
-    assert model.fc.weight is model.tok_emb.weight
+    assert model.lm_head.weight is model.tok_emb.weight
 
 
 def test_missing_tied_embeddings_key_defaults_to_untied():
     model = GptModel(make_model_config())
 
     assert model.tie_embeddings is False
-    assert model.fc.weight is not model.tok_emb.weight
+    assert model.lm_head.weight is not model.tok_emb.weight
 
 
 @pytest.mark.parametrize("spelling", ["layer_norm", "layernorm"])

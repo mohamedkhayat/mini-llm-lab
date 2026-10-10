@@ -32,41 +32,24 @@ Checkpoint payload format (version 4) — the key set, assembled by
                           current pass>}} (None in terminal-mode stubs)
 
 Checkpoints from older trainer versions are not resumable: a missing
-``steps_per_pass``, missing ``rng``, or a non-memmap ``data_state`` raises on
-resume. Start a fresh run instead.
+``steps_per_pass``, missing ``rng``, a non-memmap ``data_state``, or a
+``wsd`` entry without a ``target_step`` key all raise on resume. Start a
+fresh run instead (the single resumability policy lives in
+``training.schedule``).
 
-``restore_training_state`` expects a :class:`RunState` bundle assembled by
-the trainer (its mutable counters plus the live training loader, so the data
-cursor can be restored into it).
+``restore_training_state`` expects the trainer's
+``training.state.TrainState`` and restores the scalar counters and RNG
+streams only; the memmap data cursor is restored separately via
+``restore_data_state(loader, checkpoint['data_state'])``.
 """
 
-import io
 import random
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from training.run_manifest import atomic_write_bytes
-
-
-@dataclass
-class RunState:
-    """The trainer's mutable run state, handed across the restore seam.
-
-    Scalar counters are read back from the bundle after
-    ``restore_training_state``; the loader reference is used to restore the
-    memmap data cursor.
-    """
-
-    step: int
-    best_val_loss: float
-    wandb_run_id: str | None
-    run_elapsed_seconds: float
-    tokens_seen: int
-    tokens_per_step: int
-    train_loader: object = None
+from training.run_manifest import atomic_write
 
 
 def _launch_directory() -> Path:
@@ -110,10 +93,9 @@ def load_checkpoint(path: Path) -> dict:
 
 
 def atomic_torch_save(payload: dict, path: str | Path) -> None:
-    """Write a checkpoint atomically and make the directory entry durable."""
-    buffer = io.BytesIO()
-    torch.save(payload, buffer)
-    atomic_write_bytes(path, buffer.getvalue())
+    """Write a checkpoint atomically, streaming ``torch.save`` directly to
+    the temp file (no in-memory copy of the full payload)."""
+    atomic_write(path, lambda f: torch.save(payload, f))
 
 
 def build_checkpoint_payload(
@@ -266,7 +248,11 @@ def check_resume_consistency(
 
 
 def restore_model(model, checkpoint) -> None:
-    """Load plain or compiled-module state into the uncompiled model."""
+    """Load plain or compiled-module state into the uncompiled model.
+
+    strict=True: a missing or unexpected key surfaces as torch's native
+    error instead of being silently tolerated.
+    """
     state = checkpoint.get("model") or checkpoint.get("model_state_dict")
     if state is None:
         raise KeyError("Checkpoint does not contain a model state dictionary")
@@ -274,21 +260,16 @@ def restore_model(model, checkpoint) -> None:
     normalized_state = {
         key.removeprefix("_orig_mod."): value for key, value in state.items()
     }
-    missing, unexpected = model.load_state_dict(normalized_state, strict=False)
-    if missing or unexpected:
-        raise RuntimeError(
-            "Checkpoint model does not match the configured architecture: "
-            f"missing={missing}, unexpected={unexpected}"
-        )
+    model.load_state_dict(normalized_state, strict=True)
 
 
-def restore_training_state(state: RunState, checkpoint: dict) -> None:
-    """Restore counters, W&B identity, all RNG streams, and the data cursor.
+def restore_training_state(state, checkpoint: dict) -> None:
+    """Restore the scalar counters and all RNG streams into ``state``.
 
-    Mutates ``state`` in place: the trainer reads the bundle back after the
-    call. The memmap data cursor is restored into the training loader; a
-    checkpoint without a memmap cursor or RNG state is not resumable and
-    raises.
+    ``state`` is the trainer's ``training.state.TrainState``; the memmap
+    data cursor is NOT restored here (call ``restore_data_state`` on the
+    loader separately). A checkpoint without ``tokens_seen`` or RNG state
+    is not resumable and raises.
     """
     state.step = int(checkpoint.get("step", 0))
     state.best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
@@ -296,13 +277,12 @@ def restore_training_state(state: RunState, checkpoint: dict) -> None:
     state.run_elapsed_seconds = float(checkpoint.get("run_elapsed_seconds", 0.0))
 
     saved_tokens = checkpoint.get("tokens_seen")
-    state.tokens_seen = (
-        int(saved_tokens)
-        if saved_tokens is not None
-        else state.step * state.tokens_per_step
-    )
-
-    restore_data_state(state.train_loader, checkpoint.get("data_state"))
+    if saved_tokens is None:
+        raise ValueError(
+            "The checkpoint does not carry a tokens_seen value; it is not "
+            "resumable with this trainer. Start a fresh run instead."
+        )
+    state.tokens_seen = int(saved_tokens)
 
     rng_state = checkpoint.get("rng")
     if rng_state is None:

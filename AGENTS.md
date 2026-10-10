@@ -61,17 +61,18 @@ python -m pip install -e '.[dev]'        # runtime deps + pytest
 python train.py                          # GPU run (W&B online by default)
 pytest                                   # full test suite
 pytest tests/test_training_schedule.py -k test_name   # one test
-python -m data.token_shards --input <in> --output <out> --tokenizer gpt2   # build a token cache
 chainlit run chat.py                     # chat UI over saved checkpoints
 ```
 
-Fast CPU smoke test before any real run (no GPU / no W&B):
+Fast CPU smoke test before any real run (no GPU / no W&B; write the tiny
+`data/smoke/gpt2` cache first — one-liner in the README's smoke section):
 
 ```bash
-WANDB_MODE=disabled python train.py \
+WANDB_MODE=disabled CUDA_VISIBLE_DEVICES="" python train.py \
+  data.hf_dataset=smoke data.max_tokens=7040 \
   model.emb_dim=128 model.n_heads=4 model.n_layers=2 model.context_length=128 \
-  data.seq_len=128 data.stride=64 data.batch_size=2 data.num_workers=0 \
-  training.device=cpu training.max_steps=20 training.eval_interval=20 \
+  data.seq_len=128 training.batch_size=2 training.accum_steps=1 \
+  training.device=cpu training.eval_interval=20 \
   training.eval_batches=2 training.max_new_tokens=2
 ```
 
@@ -79,13 +80,13 @@ WANDB_MODE=disabled python train.py \
 
 - **Imports are rooted at `src/`, not the repo root.** `pyproject.toml` sets
   `pythonpath=["src"]`, so it is `import training.trainer`, `import data.dataloader`,
-  `import models.gpt` — **never** `import src.…`. Same for `-m`: `python -m data.token_shards`
-  (not `python -m src.data.token_shards`).
+  `import models.gpt` — **never** `import src.…`; any `-m` module is rooted at
+  `src/` too.
 - **`train.py` is a Hydra app, not argparse.** Arguments are `key=value` overrides
-  (`python train.py model=qwen training.max_steps=1000`); **quote list overrides**
+  (`python train.py model=qwen`); **quote list overrides**
   (`'data.files=[a.txt,b.txt]'`). Inspect the composed config with
-  `python train.py --cfg job --resolve`. Config groups: `data` (default / hf_dataset /
-  gutenberg), `model` (gpt2 / qwen / moe), `training` (default). Run output goes to
+  `python train.py --cfg job --resolve`. Config groups: `data` (default), `model`
+  (gpt2 / qwen / moe), `training` (default). Run output goes to
   `runs/<date>/<time>/`.
 - **Only `GptModel` is wired.** There is no model factory — the trainer always builds
   `GptModel` (`src/training/trainer.py`). `model=qwen` / `model=moe` still construct
@@ -113,13 +114,19 @@ WANDB_MODE=disabled python train.py \
     `GptModel`.
 - **W&B is on by default.** `WANDB_MODE=offline` for local logging,
   `WANDB_MODE=disabled` (or `training.log_backend=terminal`) to print to the terminal.
-- **Budgets are mutually exclusive:** set `training.max_steps` **or** `training.max_tokens`
-  (never both); `training.epochs` is the fallback when neither is set.
+- **The cache and phase budgets are separate:** `data.max_tokens` sizes the
+  total train+validation token cache. `training.train_tokens` selects a fresh
+  stable prefix, while `training.continue_tokens` and `training.decay_tokens`
+  request additive stable/decay phases. Additive phases automatically expand
+  and reprepare the cache when their endpoint exceeds the current train file.
 - **What is validated, and where** — do not assume setup-time checks for the rest:
-  `training.min_lr ≤ training.lr` (and > 0) and warmup ≥ 0 are enforced in
+  `training.min_lr ≤ training.lr` (and > 0), and warmup ≥ 0 are enforced in
   `training/schedule.py` on every run; decay runs run with `warmup = 0`.
-  `0 < training.lr_decay_fraction < 1` is enforced on decay runs only (a fresh
-  stable run does not check the range). `data.seq_len ≤ model.context_length` is not
+  The single-pass rule (total steps ≤ the selected train-loader cap) is enforced
+  in `Trainer.train()`: additive `continue`/decay phases first expand and
+  reprepare the cache when needed. Token fields accept decimal `k/m/b/t`
+  suffixes and phase budgets are rounded down to complete optimizer steps.
+  `data.seq_len ≤ model.context_length` is not
   checked at setup — it raises on the first forward (`GptModel.forward`). The
   divisibility checks (`model.emb_dim % model.n_heads == 0`; for GQA
   `model.n_heads % model.n_kv_heads == 0`) are `assert`s in the attention
@@ -132,7 +139,8 @@ WANDB_MODE=disabled python train.py \
 The trainer writes under the run dir: `latest.pt` (moving resume/recovery pointer,
 atomic), `best.pt` (best validation loss), `step_<N>.pt` (periodic, when
 `training.save_interval` is set), and `final_model.pt` (only when a run completes). A
-checkpoint carries model + optimizer + LR scheduler + RNG + data cursor + token counter
+checkpoint carries model + optimizer + LR scheduler + RNG + global step +
+memmap data cursor (next batch of the current pass) + token counter
 
 - W&B run id + the WSD trigger state (`wsd`). Each run dir also holds
   `run_manifest.json` (written in terminal mode too), mapping every checkpoint file to
@@ -145,8 +153,9 @@ python train.py training.resume_from=latest                # or a full path
 ```
 
 `Ctrl-C` / `SIGINT` / `SIGTERM` finish the current optimizer step and write `latest.pt`.
-For a bit-for-bit resume, keep the data source, tokenizer, model dims, batch size,
-`seq_len`, `stride`, and total budget unchanged.
+For a bit-for-bit resume, keep the data source, tokenizer, model dims,
+`training.batch_size`, `training.accum_steps`, `data.seq_len`, and total
+budget unchanged.
 
 ## Adding an attention backend (boilerplate pattern)
 
@@ -158,10 +167,10 @@ implementation needs.
 
 ## What's local-only (git-ignored)
 
-`/data/` (corpora, incl. the auto-downloaded `the_verdict` sample and `gutenberg`),
-`runs/`, `wandb/`, `checkpoints/`, and `.venv/` are ignored. Real **code** is **not**
+`/data/` (HF dataset downloads and tokenized caches), `runs/`, `wandb/`,
+`checkpoints/`, and `.venv/` are ignored. Real **code** is **not**
 ignored and should be committed — e.g. `src/models/attention/gqa.py`,
-`src/data/token_shards.py`, `chat.py`, and `tests/test_*.py`. The working tree is a WIP
+`src/data/dataloader.py`, `src/data/prepare.py`, `chat.py`, and `tests/test_*.py`. The working tree is a WIP
 lab with an evolving set of uncommitted changes — run `git status` before large edits.
 
 ## Agent skills

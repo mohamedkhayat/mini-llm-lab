@@ -95,19 +95,21 @@ def _load_existing_manifest(path: Path) -> dict:
     return manifest
 
 
-def atomic_write_bytes(destination, data) -> None:
-    """Write ``data`` to ``destination`` via a temp file + atomic rename.
+def atomic_write(destination, writer) -> None:
+    """Write via ``writer(file)`` to a temp file + atomic rename.
 
-    The file and its parent directory are fsynced, so a power loss cannot
-    lose a completed write. Shared by the manifest writer and the torch
-    checkpoint writer (``training.trainer.atomic_torch_save``).
+    ``writer`` receives the open temp file and may stream into it in
+    chunks (no in-memory copy of the full payload). The file and its
+    parent directory are fsynced, so a power loss cannot lose a completed
+    write. On a writer exception the temp file is removed and any existing
+    destination is left untouched.
     """
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
     try:
         with temporary.open("wb") as file:
-            file.write(data)
+            writer(file)
             file.flush()
             os.fsync(file.fileno())
         os.replace(temporary, destination)
@@ -123,6 +125,11 @@ def atomic_write_bytes(destination, data) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def atomic_write_bytes(destination, data) -> None:
+    """Write bytes via ``atomic_write`` (the manifest keeps this API)."""
+    atomic_write(destination, lambda f: f.write(data))
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:

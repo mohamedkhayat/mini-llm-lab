@@ -11,7 +11,6 @@ from torch import nn
 
 from data.dataloader import MemmapDataLoader
 from training.checkpointing import (
-    RunState,
     atomic_torch_save,
     build_checkpoint_payload,
     capture_data_state,
@@ -20,7 +19,8 @@ from training.checkpointing import (
     restore_data_state,
     restore_training_state,
 )
-from training.trainer import get_model_parameter_metrics
+from training.state import TrainState
+from training.utils import get_model_parameter_metrics
 
 # 81 tokens, batch 2 x 8 = 16 -> (81 - 1) // 16 = 5 batches per pass.
 BATCHES_PER_PASS = 5
@@ -132,8 +132,9 @@ def test_check_resume_consistency_rejects_a_missing_steps_per_pass():
 
 
 def test_restore_training_state_round_trip(tmp_path):
-    """A payload built from a running position restores step, counters,
-    W&B identity, and the memmap data cursor into a fresh loader bundle."""
+    """A payload built from a running position restores the scalar
+    counters into a TrainState (RNG included) and the memmap data cursor
+    into a fresh loader — via the two separate restore calls."""
     loader = make_loader(tmp_path)
     it = iter(loader)
     next(it)
@@ -166,16 +167,9 @@ def test_restore_training_state_round_trip(tmp_path):
     assert payload["checkpoint_version"] == 4
 
     fresh = make_loader(tmp_path)
-    state = RunState(
-        step=0,
-        best_val_loss=float("inf"),
-        wandb_run_id=None,
-        run_elapsed_seconds=0.0,
-        tokens_seen=0,
-        tokens_per_step=16,
-        train_loader=fresh,
-    )
+    state = TrainState()
     restore_training_state(state, payload)
+    restore_data_state(fresh, payload["data_state"])
 
     assert state.step == 3
     assert state.best_val_loss == 1.5

@@ -25,15 +25,14 @@ class GptModel(nn.Module):
         self.final_norm = get_norm(getattr(cfg, "normalization", "layer_norm"))(
             cfg.emb_dim
         )
-        self.fc = nn.Linear(cfg.emb_dim, cfg.vocab_size)
-        # Older configs/checkpoints do not have this key and are treated as
-        # untied so they remain compatible with the original training setup.
+        self.lm_head = nn.Linear(cfg.emb_dim, cfg.vocab_size, bias=False)
+        
         self.tie_embeddings = bool(getattr(cfg, "tie_embeddings", False))
         if self.tie_embeddings:
-            self.fc.weight = self.tok_emb.weight
+            self.lm_head.weight = self.tok_emb.weight
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
 
-    def forward(self, x):
+    def forward(self, x, return_logits=True):
         # x : B X SEQ_LEN
         _, seq_len = x.shape
         if seq_len > self.pos_emb.num_embeddings:
@@ -48,19 +47,28 @@ class GptModel(nn.Module):
         x = self.dropout(x)
         x = self.trf_blocks(x)
         x = self.final_norm(x)
-        logits = self.fc(x)
-        return logits
+
+        if return_logits:
+            return self.lm_head(x)
+
+        return x
+
 
     def generate(
         self,
         token_idx,
         context_length,
-        autocast_context=nullcontext(),
         max_new_tokens=10,
         temperature=1.0,
         top_k=None,
         eos_id=None,
+        autocast_context=None,
     ):
+        if autocast_context is None:
+            autocast_context = nullcontext()
+        vocab_size = self.lm_head.out_features
+        # [B] mask of rows that have hit EOS; they stay pinned at eos_id.
+        done = torch.zeros(token_idx.shape[0], dtype=torch.bool, device=token_idx.device)
         for _ in range(max_new_tokens):
             idx_cond = token_idx[:, -context_length:]
             with torch.no_grad(), autocast_context:
@@ -68,13 +76,8 @@ class GptModel(nn.Module):
 
             logits = logits[:, -1, :]  # take last position
             if top_k is not None:
-                top_logits, _ = torch.topk(logits, k=top_k)
-                min_val = top_logits[:, -1]
-                logits = torch.where(
-                    logits < min_val,
-                    torch.tensor(float("-inf")).to(logits.device),
-                    logits,
-                )
+                kth = torch.topk(logits, min(top_k, vocab_size))[0][:, -1:]
+                logits = logits.masked_fill(logits < kth, float("-inf"))
 
             if temperature > 0.0:
                 logits /= temperature
@@ -83,8 +86,14 @@ class GptModel(nn.Module):
             else:
                 next_token_idx = torch.argmax(logits, dim=-1, keepdim=True)
 
-            if next_token_idx == eos_id:
-                break
+            if eos_id is not None:
+                next_token_idx = torch.where(
+                    done.unsqueeze(-1), eos_id, next_token_idx
+                )
+                done = done | (next_token_idx.squeeze(-1) == eos_id)
+                if done.all():
+                    token_idx = torch.cat((token_idx, next_token_idx), dim=-1)
+                    break
 
             token_idx = torch.cat((token_idx, next_token_idx), dim=-1)
         return token_idx

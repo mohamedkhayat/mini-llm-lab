@@ -2,27 +2,26 @@
 
 This module answers "what LR does this run use" in one place:
 
-- ``resolve_wsd_state`` — the legacy two-field WSD trigger state retained for
-  older callers and checkpoints.
 - ``resolve_phase_budget`` — the explicit stable/decay endpoint for a run.
-- ``resolve_decay_budget`` — the legacy fraction-based helper retained only
-  for checkpoints created by the previous WSD implementation.
 - ``build_lr_lambda`` — the LR curve handed to the scheduler: linear warmup,
   then a plateau until the decay triggers, then a cosine decay to the floor.
 - ``stage_label`` — the run's stage marker (e.g. ``stage-2-decay``).
 
-New checkpoints store a decision-rich phase budget under the ``"wsd"`` key
-and retain ``{"triggered": bool, "step": int | None}`` as compatibility
-aliases. ``target_step`` and the requested/effective token counts make a
-resume independent of the original command line. Legacy checkpoints may omit
-the key entirely or contain only the two aliases; both are migrated by
-``_saved_phase_budget``.
+Resumability policy (single source of truth): a checkpoint is resumable only
+if its ``wsd`` entry carries a ``target_step`` key — the decision-rich phase
+budget (``PhaseBudget.as_dict()`` plus the ``triggered``/``step``
+compatibility aliases). Checkpoints written by older trainers (a ``wsd``
+dict with only ``triggered``/``step``, or no ``wsd`` key at all) are NOT
+resumable; ``_saved_phase_budget`` raises a clear ``ValueError`` naming the
+missing key. (This matches ``training.checkpointing``: old checkpoints are
+not resumable, start a fresh run instead.)
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from data.budget import complete_optimizer_steps, parse_token_budget
+from training.checkpointing import check_resume_consistency
 
 
 @dataclass(frozen=True)
@@ -37,6 +36,9 @@ class PhaseBudget:
     effective_tokens: int | None
     decay_start_step: int | None = None
     decay_steps: int | None = None
+    # Computed once at budget resolution and persisted so the LR curve is
+    # independent of later config edits (0 for resumes and decay runs).
+    warmup_steps: int = 0
 
     def as_dict(self) -> dict:
         """Return the checkpoint/logging representation."""
@@ -49,6 +51,7 @@ class PhaseBudget:
             "effective_tokens": self.effective_tokens,
             "decay_start_step": self.decay_start_step,
             "decay_steps": self.decay_steps,
+            "warmup_steps": self.warmup_steps,
         }
 
 
@@ -76,8 +79,21 @@ def _saved_step(checkpoint: dict | None) -> int:
 def _saved_phase_budget(
     checkpoint: dict | None,
     tokens_per_step: int,
+    warmup_fraction: float = 0.0,
 ) -> PhaseBudget | None:
-    """Recover an explicit phase endpoint or a legacy saved decay endpoint."""
+    """Recover an explicit phase endpoint from a saved checkpoint.
+
+    The saved ``wsd`` entry must carry a ``target_step`` key (the phase
+    budget written by the current trainer); legacy entries with only the
+    ``triggered``/``step`` aliases are not resumable and raise. A fresh run
+    (``checkpoint is None``) returns None; a one-pass checkpoint
+    (``target_step is None``) returns None so the exact-resume fallback uses
+    the saved ``total_steps``.
+
+    ``warmup_steps`` is restored from the saved entry; old-format entries
+    without the key fall back to the historical rule (recompute from
+    ``warmup_fraction * total_steps`` for a fresh stable start, else 0).
+    """
     if checkpoint is None:
         return None
 
@@ -85,6 +101,13 @@ def _saved_phase_budget(
     saved_wsd = checkpoint.get("wsd")
     if not isinstance(saved_wsd, dict):
         saved_wsd = {}
+
+    if "target_step" not in saved_wsd:
+        raise ValueError(
+            "The checkpoint's wsd entry does not carry a target_step value; "
+            "it was written by an older trainer and is not resumable with "
+            "this trainer. Start a fresh run instead."
+        )
 
     target_step = saved_wsd.get("target_step")
     if isinstance(target_step, int) and target_step >= saved_step:
@@ -110,6 +133,17 @@ def _saved_phase_budget(
                 if decay_steps is not None
                 else target_step - decay_start
             )
+        if "warmup_steps" in saved_wsd:
+            warmup_steps = int(saved_wsd["warmup_steps"])
+        else:
+            # Old-format checkpoint: the historical rule — warmup only on a
+            # fresh stable start (stage stable, start step 0).
+            is_fresh_stable_start = stage == "stable" and start_step == 0
+            warmup_steps = (
+                int(warmup_fraction * int(target_step))
+                if is_fresh_stable_start
+                else 0
+            )
         return PhaseBudget(
             mode=str(saved_wsd.get("mode", "checkpoint")),
             stage=stage,
@@ -119,31 +153,8 @@ def _saved_phase_budget(
             effective_tokens=int(effective_tokens),
             decay_start_step=decay_start,
             decay_steps=decay_steps,
+            warmup_steps=warmup_steps,
         )
-
-    # Checkpoints written by the previous implementation have only
-    # {triggered, step}; their total_steps already contains the chosen decay
-    # endpoint.  Preserve that endpoint without consulting the removed config
-    # fraction.
-    if saved_wsd.get("triggered") is True:
-        saved_total = checkpoint.get("total_steps")
-        saved_trigger = saved_wsd.get("step")
-        if (
-            isinstance(saved_total, int)
-            and isinstance(saved_trigger, int)
-            and saved_total >= saved_trigger >= 0
-        ):
-            decay_steps = saved_total - saved_trigger
-            return PhaseBudget(
-                mode="legacy_decay",
-                stage="decay",
-                start_step=saved_trigger,
-                target_step=saved_total,
-                requested_tokens=decay_steps * tokens_per_step,
-                effective_tokens=decay_steps * tokens_per_step,
-                decay_start_step=saved_trigger,
-                decay_steps=decay_steps,
-            )
     return None
 
 
@@ -167,7 +178,11 @@ def resolve_phase_budget(training_cfg, checkpoint, tokens_per_step: int) -> Phas
         raise ValueError("training.resume_mode must be 'exact' or 'continue'")
 
     start_decay = bool(getattr(training_cfg, "start_decay", False))
-    saved_budget = _saved_phase_budget(checkpoint, tokens_per_step)
+    saved_budget = _saved_phase_budget(
+        checkpoint,
+        tokens_per_step,
+        warmup_fraction=float(getattr(training_cfg, "warmup_fraction", 0.0)),
+    )
     if saved_budget is not None:
         # An active decay is authoritative: re-running the launcher after a
         # crash must continue the original cosine endpoint.  A saved stable
@@ -282,72 +297,12 @@ def resolve_phase_budget(training_cfg, checkpoint, tokens_per_step: int) -> Phas
     )
 
 
-def resolve_continuation_steps(training_cfg, tokens_per_step):
-    """Convert a stable continuation's additional token budget to steps."""
-    requested_tokens = getattr(training_cfg, "continue_tokens", None)
-    if requested_tokens is None:
-        raise ValueError(
-            "training.resume_mode=continue requires training.continue_tokens."
-        )
-    return complete_optimizer_steps(
-        requested_tokens,
-        tokens_per_step,
-        "training.continue_tokens",
-    )[0]
-
-
-def resolve_decay_budget(steps_done, decay_fraction):
-    """Derive the WSD decay budget from where stage 1 stopped.
-
-    The decay occupies the final ``decay_fraction`` of the whole run, so for a
-    trigger at step ``S`` the decay length is ``D = round(S * f / (1 - f))``
-    and the total budget is ``S + D`` (rule of three). ``f`` must be in
-    ``(0, 1)``; a degenerate ``S = 0`` still runs at least one decay step.
-    """
-    steps_done = int(steps_done)
-    decay_fraction = float(decay_fraction)
-
-    if steps_done < 0:
-        raise ValueError(
-            "steps_done must be >= 0 (the trigger step of the decay run); "
-            f"got {steps_done}"
-        )
-    if not 0.0 < decay_fraction < 1.0:
-        raise ValueError(
-            "training.lr_decay_fraction must be in (0, 1): the decay is the "
-            f"final fraction of the run; got {decay_fraction}"
-        )
-
-    decay_steps = max(1, round(steps_done * decay_fraction / (1.0 - decay_fraction)))
-    return steps_done + decay_steps, decay_steps
-
-
-def resolve_wsd_state(saved_wsd, start_decay, resume_step):
-    """Resolve the live WSD state for a (possibly resumed) run.
-
-    A valid triggered state saved in a checkpoint takes precedence over a
-    fresh ``start_decay`` flag, so a crash mid-decay resumes from the
-    original trigger step instead of restarting the decay. Legacy
-    checkpoints without a ``wsd`` entry (or with an untriggered one) fall
-    back to the flag: ``start_decay`` then triggers the decay at the
-    resume step.
-    """
-    saved = saved_wsd if isinstance(saved_wsd, dict) else {}
-    saved_step = saved.get("step")
-    if (
-        saved.get("triggered") is True
-        and isinstance(saved_step, int)
-        and saved_step >= 0
-    ):
-        return {"triggered": True, "step": saved_step}
-    if start_decay:
-        return {"triggered": True, "step": int(resume_step)}
-    return {"triggered": False, "step": None}
-
-
-def build_lr_lambda(warmup_steps, decay_steps, peak_lr, min_lr, wsd_state):
+def build_lr_lambda(warmup_steps, peak_lr, min_lr, phase: PhaseBudget):
+    """Linear warmup, then — for a decay phase — a cosine decay from
+    ``phase.decay_start_step`` over ``phase.decay_steps`` down to min_lr.
+    Reads the phase directly (no wsd-state dict, no ``triggered``/``step``
+    aliases)."""
     warmup_steps = int(warmup_steps)
-    decay_steps = max(1, int(decay_steps))
     peak_lr = float(peak_lr)
     min_lr = float(min_lr)
 
@@ -360,24 +315,135 @@ def build_lr_lambda(warmup_steps, decay_steps, peak_lr, min_lr, wsd_state):
         )
 
     min_scale = min_lr / peak_lr
+    decay = phase.stage == "decay"
+    decay_start = phase.decay_start_step
+    decay_steps = max(1, int(phase.decay_steps)) if phase.decay_steps else 1
 
     def lr_lambda(step):
-        # Warm up linearly, then decay to min_lr by decay_end_step and hold.
+        # Warm up linearly, then decay to min_lr by the decay end and hold.
         if warmup_steps > 0 and step < warmup_steps:
             return (step + 1) / warmup_steps
 
-        if wsd_state["triggered"] is True and wsd_state["step"] is not None:
-            progress = min(max(step - wsd_state["step"], 0) / decay_steps, 1.0)
+        if decay and decay_start is not None:
+            progress = min(max(step - decay_start, 0) / decay_steps, 1.0)
             cosine_scale = 0.5 * (1.0 + math.cos(math.pi * progress))
-
-        else:
-            return 1.0
-        return min_scale + (1.0 - min_scale) * cosine_scale
+            return min_scale + (1.0 - min_scale) * cosine_scale
+        return 1.0
 
     return lr_lambda
+
+
+@dataclass(frozen=True)
+class Budget:
+    """The run's resolved step/token budget (spec 5.9): built once by the
+    assembly (the trainer constructor until T6.2); replaces the per-attribute
+    budget state on the trainer."""
+
+    phase: PhaseBudget
+    total_steps: int
+    steps_per_pass: int
+    available_steps_per_pass: int
+    tokens_per_step: int
+    budget_name: str
+    continuation_run: bool
+    decay_run: bool
+    total_train_tokens: int
 
 
 def stage_label(resumed, decay_triggered):
     """Return the W&B stage marker for the run (e.g. ``stage-2-decay``)."""
     stage = "stage-2" if resumed else "stage-1"
     return f"{stage}-{'decay' if decay_triggered else 'stable'}"
+
+
+_BUDGET_NAMES = {
+    "one_pass": "one_pass",
+    "train_tokens": "train_tokens",
+    "stable_continue": "continue_tokens",
+    "decay_tokens": "wsd_decay_tokens",
+    "legacy_decay": "wsd_decay_legacy",
+    "exact_resume": "exact_resume",
+}
+
+
+def resolve_budget(
+    training_cfg,
+    checkpoint: dict | None,
+    *,
+    steps_per_pass: int,
+    available_steps_per_pass: int,
+    tokens_per_step: int,
+    phase: PhaseBudget | None = None,
+) -> Budget:
+    """Resolve the run's full Budget (spec 5.9) and validate resume
+    geometry — pure, no trainer, no I/O (T6.3: moved out of
+    ``Trainer._resolve_budget`` so assembly can validate BEFORE any
+    logging/W&B side effect, P3).
+
+    ``phase`` may be pre-resolved by the caller (the loader needs the
+    endpoint before it is built); without it, it is resolved here.
+    Warmup is filled once for fresh stable starts and persisted on the
+    phase, so the resume LR curve is independent of later
+    ``warmup_fraction`` edits; a namespace without the key means no warmup.
+    """
+    resume_mode = str(getattr(training_cfg, "resume_mode", "exact"))
+    if resume_mode not in {"exact", "continue"}:
+        raise ValueError("training.resume_mode must be 'exact' or 'continue'")
+
+    phase = phase or resolve_phase_budget(training_cfg, checkpoint, tokens_per_step)
+    continuation_run = phase.mode == "stable_continue"
+    decay_run = phase.stage == "decay"
+
+    total_steps = (
+        phase.target_step if phase.target_step is not None else steps_per_pass
+    )
+    budget_name = _BUDGET_NAMES.get(phase.mode, phase.mode)
+
+    if (
+        phase.stage == "stable"
+        and phase.start_step == 0
+        and phase.warmup_steps == 0
+    ):
+        phase = replace(
+            phase,
+            warmup_steps=int(
+                float(getattr(training_cfg, "warmup_fraction", 0.0)) * total_steps
+            ),
+        )
+
+    budget = Budget(
+        phase=phase,
+        total_steps=total_steps,
+        steps_per_pass=steps_per_pass,
+        available_steps_per_pass=available_steps_per_pass,
+        tokens_per_step=tokens_per_step,
+        budget_name=budget_name,
+        continuation_run=continuation_run,
+        decay_run=decay_run,
+        total_train_tokens=total_steps * tokens_per_step,
+    )
+
+    if checkpoint is not None:
+        check_resume_consistency(
+            saved_total_steps=checkpoint.get("total_steps"),
+            total_steps=total_steps,
+            saved_steps_per_pass=checkpoint.get("steps_per_pass"),
+            steps_per_pass=steps_per_pass,
+            saved_tokens_per_step=checkpoint.get("tokens_per_step"),
+            tokens_per_step=tokens_per_step,
+            decay_run=decay_run,
+            continuation_run=continuation_run,
+            allow_capacity_growth=continuation_run or decay_run,
+            available_steps_per_pass=available_steps_per_pass,
+        )
+
+    if budget.total_steps > steps_per_pass:
+        raise ValueError(
+            f"The training budget ({budget.total_steps:,} steps) exceeds one "
+            f"pass over the data file ({steps_per_pass:,} steps). The launcher "
+            "should have expanded the cache before loader construction; check "
+            "data.max_tokens and the phase budget, then resume from the last "
+            "checkpoint."
+        )
+
+    return budget

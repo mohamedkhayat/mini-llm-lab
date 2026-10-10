@@ -19,6 +19,7 @@ by kind, and finish.
 
 import os
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 # Aliases accepted for ``training.log_backend``.
 _BACKEND_ALIASES = {"term": "terminal", "console": "terminal"}
@@ -48,6 +49,22 @@ def resolve_log_backend(training_cfg, wandb_mode=None):
     return log_backend
 
 
+@dataclass(frozen=True)
+class RunInfo:
+    """The run's identity for ``RunLogger.init`` — replaces the 9-kwarg
+    keyword list (spec 5.7). A resumed run keeps the original run's config
+    and name (``saved_config`` wins when present)."""
+
+    name: str
+    config: dict
+    saved_config: dict | None
+    resumed_run_id: str | None
+    computed: dict
+    stage_marker: dict
+    parameter_metrics: dict
+    step: int
+
+
 class RunLogger(ABC):
     """One interface for run logging, one adapter per backend.
 
@@ -56,21 +73,8 @@ class RunLogger(ABC):
     """
 
     @abstractmethod
-    def init(
-        self,
-        *,
-        name,
-        config,
-        computed,
-        stage_marker,
-        parameter_metrics,
-        step,
-        saved_config=None,
-        resumed_run_id=None,
-    ) -> None:
-        """Start the run: name, resolved config, computed budget values,
-        the stage marker, parameter metrics, and an optional resumed W&B run
-        id. A resumed run keeps the original run's config and name."""
+    def init(self, info: RunInfo) -> None:
+        """Start the run from a single ``RunInfo``."""
 
     @abstractmethod
     def log_metrics(self, metrics, step) -> None:
@@ -98,18 +102,7 @@ class RunLogger(ABC):
 class TerminalLogger(RunLogger):
     """Prints only; holds no reference to W&B at all."""
 
-    def init(
-        self,
-        *,
-        name,
-        config,
-        computed,
-        stage_marker,
-        parameter_metrics,
-        step,
-        saved_config=None,
-        resumed_run_id=None,
-    ) -> None:
+    def init(self, info: RunInfo) -> None:
         # Terminal runs carry no run-level log output at init; the console
         # lines (budget, model summary, per-step progress) are printed by the
         # trainer itself.
@@ -142,18 +135,13 @@ class WandbLogger(RunLogger):
         self.run_id = None
         self._run = None
 
-    def init(
-        self,
-        *,
-        name,
-        config,
-        computed,
-        stage_marker,
-        parameter_metrics,
-        step,
-        saved_config=None,
-        resumed_run_id=None,
-    ) -> None:
+    def init(self, info: RunInfo) -> None:
+        name, config = info.name, info.config
+        saved_config = info.saved_config
+        resumed_run_id = info.resumed_run_id
+        computed, stage_marker = info.computed, info.stage_marker
+        parameter_metrics, step = info.parameter_metrics, info.step
+
         if saved_config is not None:
             # Keep the resumed run's original configuration in W&B; the
             # resume path itself is an invocation detail, not a new

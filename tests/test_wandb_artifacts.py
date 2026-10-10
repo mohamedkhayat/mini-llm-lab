@@ -1,6 +1,7 @@
 import wandb
 
 from training.log_backend import (
+    RunInfo,
     TerminalLogger,
     WandbLogger,
     build_artifact_metadata,
@@ -151,12 +152,16 @@ def test_terminal_adapter_performs_no_wandb_interaction(monkeypatch):
     logger = TerminalLogger()
     assert not hasattr(logger, "_wandb")
     logger.init(
-        name="exp",
-        config={},
-        computed={},
-        stage_marker={"training_stage": "stage-1-stable"},
-        parameter_metrics={},
-        step=0,
+        RunInfo(
+            name="exp",
+            config={},
+            saved_config=None,
+            resumed_run_id=None,
+            computed={},
+            stage_marker={"training_stage": "stage-1-stable"},
+            parameter_metrics={},
+            step=0,
+        )
     )
     logger.log_metrics({"train/loss": 1.0, "step": 5}, step=5)
     logger.log_sample("hello world", step=5, loss=0.5)
@@ -206,20 +211,22 @@ def test_wandb_adapter_resumed_run_keeps_the_original_config_and_name():
     saved_config = {"training": {"exp_name": "original"}}
 
     logger.init(
-        name="renamed-on-relaunch",
-        config={"training": {"exp_name": "renamed-on-relaunch"}},
-        saved_config=saved_config,
-        computed={"computed_total_steps": 38},
-        stage_marker={"training_stage": "stage-2-decay"},
-        parameter_metrics={
-            "model/parameters_total": 1000,
-            "model/parameters_trainable": 900,
-            "model/parameters_non_trainable": 100,
-            "model/parameter_memory_bytes": 4000,
-            "model/parameter_memory_mb": 0.0038,
-        },
-        step=38,
-        resumed_run_id="abc123",
+        RunInfo(
+            name="renamed-on-relaunch",
+            config={"training": {"exp_name": "renamed-on-relaunch"}},
+            saved_config=saved_config,
+            resumed_run_id="abc123",
+            computed={"computed_total_steps": 38},
+            stage_marker={"training_stage": "stage-2-decay"},
+            parameter_metrics={
+                "model/parameters_total": 1000,
+                "model/parameters_trainable": 900,
+                "model/parameters_non_trainable": 100,
+                "model/parameter_memory_bytes": 4000,
+                "model/parameter_memory_mb": 0.0038,
+            },
+            step=38,
+        )
     )
 
     assert fake.init_calls == [

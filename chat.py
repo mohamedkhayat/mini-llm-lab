@@ -12,6 +12,7 @@ from chainlit.input_widget import Select, Slider
 from omegaconf import DictConfig, OmegaConf
 import torch
 
+from data.budget import parse_token_budget
 from data.tokenizer import get_tokenizer, text_to_token_ids, token_ids_to_text
 from models.gpt import GptModel
 
@@ -57,7 +58,7 @@ def _load_run_config(checkpoint_path: Path) -> DictConfig | None:
     )
     for config_path in candidates:
         if config_path.exists():
-            return OmegaConf.load(config_path)
+            return OmegaConf.load(config_path)  # type: ignore[return-value]
     return None
 
 
@@ -103,9 +104,11 @@ def _format_count(value: int | None) -> str:
 
 
 def _planned_training_description(cfg: DictConfig | None) -> str:
-    data_max_tokens = _cfg_value(cfg, "data.max_tokens")
+    data_max_tokens = parse_token_budget(
+        _cfg_value(cfg, "data.max_tokens"), "data.max_tokens"
+    )
     if data_max_tokens is not None:
-        return f"≤ {_format_count(int(data_max_tokens))} tokens (one pass over the data)"
+        return f"≤ {_format_count(data_max_tokens)} tokens (one pass over the data)"
     return "budget unknown"
 
 
@@ -138,7 +141,7 @@ def _load_checkpoint_config(
 ) -> DictConfig:
     cfg = checkpoint.get("cfg")
     if cfg is not None:
-        return OmegaConf.create(cfg)
+        return OmegaConf.create(cfg)  # type: ignore[return-value]
 
     sidecar_cfg = _load_run_config(checkpoint_path)
     if sidecar_cfg is None:

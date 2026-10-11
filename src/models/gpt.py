@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from models.blocks.transformerBlock import TransformerBlock
 from models.normalization.normalization import get_norm
-
+import math
 # GPT-2 style model
 
 
@@ -35,8 +35,15 @@ class GptModel(nn.Module):
         self.tie_embeddings = bool(getattr(cfg, "tie_embeddings", False))
         if self.tie_embeddings:
             self.lm_head.weight = self.tok_emb.weight
-            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
+        
+        self.apply(self._init_weights)
 
+        for pn, p in self.named_parameters():
+            if pn.endswith("c_proj.weight"):
+                torch.nn.init.normal_(
+                    p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layers)
+                )
+        
     def forward(self, x, return_logits=True):
         # x : B X SEQ_LEN
         _, seq_len = x.shape
@@ -102,3 +109,12 @@ class GptModel(nn.Module):
 
             token_idx = torch.cat((token_idx, next_token_idx), dim=-1)
         return token_idx
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                torch.nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                

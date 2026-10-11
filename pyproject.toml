@@ -3,7 +3,7 @@ name = "mini-llm-lab"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "torch>=2.4",
+    "torch>=2.10",
     "tiktoken>=0.5",
     "hydra-core>=1.3",
     "omegaconf>=2.3",
@@ -12,6 +12,7 @@ dependencies = [
     "numpy>=1.26",
     "wandb>=0.17",
     "chainlit>=2.11",
+    "liger-kernel"
 ]
 
 [project.optional-dependencies]

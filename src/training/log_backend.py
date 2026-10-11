@@ -166,22 +166,29 @@ class WandbLogger(RunLogger):
         self._wandb.init(**wandb_kwargs)
         self._run = self._wandb.run
 
-        self._wandb.config.update(
-            {
-                **computed,
-                **stage_marker,
-                "model_parameters_total": parameter_metrics["model/parameters_total"],
-                "model_parameters_trainable": parameter_metrics[
-                    "model/parameters_trainable"
-                ],
-                "model_parameters_non_trainable": parameter_metrics[
-                    "model/parameters_non_trainable"
-                ],
-                "model_parameter_memory_mb": parameter_metrics[
-                    "model/parameter_memory_mb"
-                ],
+        payload = {
+            **computed,
+            **stage_marker,
+            "model_parameters_total": parameter_metrics["model/parameters_total"],
+            "model_parameters_trainable": parameter_metrics[
+                "model/parameters_trainable"
+            ],
+            "model_parameters_non_trainable": parameter_metrics[
+                "model/parameters_non_trainable"
+            ],
+            "model_parameter_memory_mb": parameter_metrics[
+                "model/parameter_memory_mb"
+            ],
+        }
+        if resumed_run_id is not None:
+            # A resumed run keeps its restored original config values; W&B
+            # raises ConfigError if update() changes an existing value.
+            existing = dict(self._wandb.config.items())
+            payload = {
+                k: v for k, v in payload.items()
+                if k not in existing or existing[k] == v
             }
-        )
+        self._wandb.config.update(payload)
         self._wandb.log({**parameter_metrics, "step": step}, step=step)
 
     def log_metrics(self, metrics, step) -> None:

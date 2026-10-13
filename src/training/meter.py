@@ -8,7 +8,8 @@ detached tensor every optimizer step, ``mean_and_reset`` is the single
 """
 
 import time
-
+from collections import defaultdict
+import re
 import torch
 
 
@@ -82,6 +83,94 @@ class ThroughputMeter:
         return elapsed, tokens_since / max(elapsed, 1e-9)
 
 
+_GROUPS = (
+    ("tok_emb", "emb_head"),
+    ("lm_head", "emb_head"),
+    ("pos_emb", "pos_emb"),
+    ("W_query", "attn_q"),
+    ("W_key", "attn_k"),
+    ("W_value", "attn_v"),
+    (".qkv.", "attn_qkv"),
+    ("out_proj", "attn_out"),
+    (".ffn.", "ffn"),
+)  # anything else (the norm scales) falls through to "norm"
+_LAYER = re.compile(r"trf_blocks\.(\d+)\.")
+
+
+def _group(name: str) -> str:
+    return next((g for key, g in _GROUPS if key in name), "norm")
+
+
+class GradMonitor:
+    """Spike diagnostics, GPU-side like ``LossAccumulator``.
+
+    ``add`` runs every optimizer step (no host sync); ``report`` runs at log
+    steps. Call ``add`` after backward and BEFORE clipping: clip_grad_norm_
+    rescales ``.grad`` in place.
+    """
+
+    def __init__(self, model, clip_norm: float):
+        raw = getattr(model, "_orig_mod", model)
+        named = [(n, p) for n, p in raw.named_parameters() if p.requires_grad]
+        self._names = [n for n, _ in named]
+        self._params = [p for _, p in named]
+        self._clip = float(clip_norm)
+        self._norms: list = []  # per step: [num_params] pre-clip grad norms
+        self._micro: list = []  # per step: [accum_steps] micro-batch losses
+
+    @torch.no_grad()
+    def add(self, micro_losses) -> None:
+        zero = self._params[0].new_zeros(())
+        self._norms.append(
+            torch.stack(
+                [
+                    torch.linalg.vector_norm(p.grad) if p.grad is not None else zero
+                    for p in self._params
+                ]
+            )
+        )
+        self._micro.append(torch.stack(micro_losses))
+
+    @torch.no_grad()
+    def report(self) -> tuple[float, dict]:
+        """Return (interval-mean grad norm, extra metrics) and reset."""
+        if not self._norms:
+            raise RuntimeError("GradMonitor.report with no recorded steps")
+        pp = torch.stack(self._norms)  # [steps, params]
+        micro = torch.stack(self._micro)  # [steps, accum]
+        self._norms.clear()
+        self._micro.clear()
+
+        gn = pp.norm(dim=1)  # [steps] total pre-clip grad norm
+        mean, peak, clipped, micro_max = torch.stack(
+            [gn.mean(), gn.max(), (gn > self._clip).sum().float(), micro.max()]
+        ).tolist()
+        extras = {
+            "train/grad_norm_max": peak,
+            "train/clipped_steps": clipped,
+            "train/micro_loss_max": micro_max,
+        }
+
+        # Breakdown at the worst step of the interval.
+        worst = int(gn.argmax())
+        groups, layers = defaultdict(float), defaultdict(float)
+        for name, v in zip(self._names, pp[worst].tolist()):
+            groups[_group(name)] += v * v
+            if m := _LAYER.search(name):
+                layers[int(m.group(1))] += v * v
+        extras.update({f"grad/group/{g}": s**0.5 for g, s in groups.items()})
+        extras.update(
+            {f"grad/layer/{i:02d}": s**0.5 for i, s in sorted(layers.items())}
+        )
+        extras.update(
+            {
+                f"grad/worst_micro_loss/{i}": v
+                for i, v in enumerate(micro[worst].tolist())
+            }
+        )
+        return mean, extras
+
+
 class LossAccumulator:
     """GPU-side train/loss buffer: no host sync until ``mean_and_reset``.
 
@@ -114,16 +203,10 @@ def gpu_memory_metrics(device) -> dict:
     if device.type != "cuda":
         return {}
     return {
-        "system/gpu_memory_allocated_gb": torch.cuda.memory_allocated(device)
+        "system/gpu_memory_allocated_gb": torch.cuda.memory_allocated(device) / 1024**3,
+        "system/gpu_memory_reserved_gb": torch.cuda.memory_reserved(device) / 1024**3,
+        "system/gpu_memory_peak_allocated_gb": torch.cuda.max_memory_allocated(device)
         / 1024**3,
-        "system/gpu_memory_reserved_gb": torch.cuda.memory_reserved(device)
-        / 1024**3,
-        "system/gpu_memory_peak_allocated_gb": torch.cuda.max_memory_allocated(
-            device
-        )
-        / 1024**3,
-        "system/gpu_memory_peak_reserved_gb": torch.cuda.max_memory_reserved(
-            device
-        )
+        "system/gpu_memory_peak_reserved_gb": torch.cuda.max_memory_reserved(device)
         / 1024**3,
     }

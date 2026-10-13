@@ -12,7 +12,7 @@ from typing import cast
 import torch
 from torch.nn.utils import clip_grad_norm_
 
-from training.meter import LossAccumulator, gpu_memory_metrics
+from training.meter import GradMonitor, LossAccumulator, gpu_memory_metrics
 from training.shutdown import GracefulShutdown
 from training.tracking import ProgressSnapshot
 
@@ -76,6 +76,7 @@ class Trainer:
         self.intervals = intervals
         self.accum_steps = accum_steps
         self.max_grad_norm = max_grad_norm
+        self.grad_monitor = GradMonitor(model, max_grad_norm)
         self.autocast_ctx = autocast_ctx
         # Derived from the model rather than a config: the loop only needs
         # it for the throughput meter and the GPU-memory metrics.
@@ -93,12 +94,15 @@ class Trainer:
         accumulation): losses are scaled by 1/accum_steps, gradients
         clipped, then one optimizer + LR step. Returns
         (loss_tensor, grad_norm_tensor) with no host sync (spec #2)."""
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         total = 0.0
+        micro = []
         for x, y in micro_batches:
             loss = self.loss_fn(x, y) / self.accum_steps
             loss.backward()
             total += loss.detach()
+            micro.append(loss.detach() * self.accum_steps)
+        self.grad_monitor.add(micro)
         grad_norm = clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         self.optimizer.step()
         self.scheduler.step()
@@ -106,10 +110,11 @@ class Trainer:
         # one micro-batch, so the first += replaces the 0.0 seed.
         return cast("torch.Tensor", total), grad_norm
 
-    def _log_progress(self, grad_norm):
+    def _log_progress(self):
         # The single .item() on the log path (the interval mean from the
         # GPU-side accumulator); the meter owns the interval timing.
         loss = self.loss_accum.mean_and_reset()
+        grad_norm, extras = self.grad_monitor.report()
         elapsed, tok_per_sec = self.meter.tick(self.state.tokens_seen)
         self.state.run_elapsed_seconds = self.clock.elapsed()
         self.tracker.log_progress(
@@ -126,6 +131,7 @@ class Trainer:
                 interval_seconds=elapsed,
                 elapsed_seconds=self.state.run_elapsed_seconds,
                 gpu_metrics=gpu_memory_metrics(self.device),
+                extra_metrics=extras,
             )
         )
 
@@ -199,10 +205,7 @@ class Trainer:
         with self.shutdown as stop:
             try:
                 batch_iter = iter(self.train_loader)
-                while (
-                    self.state.step < self.budget.total_steps
-                    and not stop.requested
-                ):
+                while self.state.step < self.budget.total_steps and not stop.requested:
                     # #1: pull one group of micro-batches. A stop requested
                     # during the pull is honored before the step: the pulled
                     # micro-batches are discarded and the data cursor is
@@ -227,7 +230,7 @@ class Trainer:
                         break
 
                     # #2: one optimizer step, no host sync.
-                    loss, grad_norm = self.train_step(micro_batches)
+                    loss, _ = self.train_step(micro_batches)
                     self.state.step += 1
                     self.state.tokens_seen += self.budget.tokens_per_step
 
@@ -239,7 +242,7 @@ class Trainer:
                     # covers fewer steps than the full interval.)
                     self.loss_accum.add(loss)
                     if self.state.step % self.intervals.log_interval == 0:
-                        self._log_progress(grad_norm.item())
+                        self._log_progress()
                     # #4: periodic evaluation + best checkpoint.
                     if self.state.step % self.intervals.eval_interval == 0:
                         self._run_evaluation()

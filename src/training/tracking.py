@@ -25,20 +25,29 @@ class ProgressSnapshot:
     tokens_seen: int
     tokens_per_step: int
     loss: float
-    grad_norm: float
+    grad_norm: float | None
     lr: float
     tok_per_sec: float
     interval_seconds: float
     elapsed_seconds: float
     gpu_metrics: dict
+    extra_metrics: dict
 
 
 class RunTracker:
     """Run events + checkpoint reporting for one run, behind an
     explicit-value interface."""
 
-    def __init__(self, logger: RunLogger, *, save_dir, run_name: str,
-                 git_commit, config_digest, terminal: bool = True):
+    def __init__(
+        self,
+        logger: RunLogger,
+        *,
+        save_dir,
+        run_name: str,
+        git_commit,
+        config_digest,
+        terminal: bool = True,
+    ):
         self._logger = logger
         self._save_dir = save_dir
         self._run_name = run_name
@@ -82,13 +91,16 @@ class RunTracker:
             "run/estimated_remaining_seconds": estimated_remaining_seconds,
             "step": snap.step,
             **snap.gpu_metrics,
+            **snap.extra_metrics,
         }
         if snap.grad_norm is not None:
             metrics["train/grad_norm"] = snap.grad_norm
         self.log_metrics(metrics, snap.step)
+        gn = f" | gn {snap.grad_norm:.3f}" if snap.grad_norm is not None else ""
         print(
             f"step {snap.step} | tokens {format_count(snap.tokens_seen)} | "
-            f"loss {snap.loss:.4f} | lr {snap.lr:.2e} | tok/s {snap.tok_per_sec:,.0f}"
+            f"loss {snap.loss:.4f} | lr {snap.lr:.2e} | "
+            f"tok/s {snap.tok_per_sec:,.0f}{gn}"
         )
 
     def log_evaluation(self, step, result, prefix="val") -> None:
@@ -139,8 +151,18 @@ class RunTracker:
             snap.step,
         )
 
-    def record_checkpoint(self, kind, filename, *, step, tokens_seen, stage,
-                          best_val_loss, wandb_run_id, final_eval=None) -> None:
+    def record_checkpoint(
+        self,
+        kind,
+        filename,
+        *,
+        step,
+        tokens_seen,
+        stage,
+        best_val_loss,
+        wandb_run_id,
+        final_eval=None,
+    ) -> None:
         """Update the local run manifest; failures never stop training.
 
         ``final_eval`` (F7) is the end-of-run ``EvalResult`` for the

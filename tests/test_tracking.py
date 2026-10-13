@@ -39,11 +39,19 @@ class _RecordingLogger:
 
 def _snap(**overrides):
     fields = dict(
-        step=10, total_steps=100, steps_per_pass=50,
-        tokens_seen=640, tokens_per_step=64,
-        loss=1.23456, grad_norm=0.5, lr=5e-4,
-        tok_per_sec=11464.3, interval_seconds=0.05,
-        elapsed_seconds=20.0, gpu_metrics={"gpu/memory_used_gib": 1.5},
+        step=10,
+        total_steps=100,
+        steps_per_pass=50,
+        tokens_seen=640,
+        tokens_per_step=64,
+        loss=1.23456,
+        grad_norm=0.5,
+        lr=5e-4,
+        tok_per_sec=11464.3,
+        interval_seconds=0.05,
+        elapsed_seconds=20.0,
+        gpu_metrics={"gpu/memory_used_gib": 1.5},
+        extra_metrics={"train/grad_norm_max": 1.25},
     )
     fields.update(overrides)
     return ProgressSnapshot(**fields)
@@ -52,20 +60,34 @@ def _snap(**overrides):
 def _tracker(tmp_path, terminal=True):
     logger = _RecordingLogger()
     tracker = RunTracker(
-        logger, save_dir=str(tmp_path), run_name="run",
-        git_commit="deadbeef", config_digest="cfg123", terminal=terminal,
+        logger,
+        save_dir=str(tmp_path),
+        run_name="run",
+        git_commit="deadbeef",
+        config_digest="cfg123",
+        terminal=terminal,
     )
     return tracker, logger
 
 
-def test_progress_snapshot_has_the_twelve_spec_fields():
+def test_progress_snapshot_has_the_thirteen_spec_fields():
     snap = _snap()
     with pytest.raises(dataclasses.FrozenInstanceError):
         snap.step = 1
     assert {f.name for f in dataclasses.fields(snap)} == {
-        "step", "total_steps", "steps_per_pass", "tokens_seen",
-        "tokens_per_step", "loss", "grad_norm", "lr", "tok_per_sec",
-        "interval_seconds", "elapsed_seconds", "gpu_metrics",
+        "step",
+        "total_steps",
+        "steps_per_pass",
+        "tokens_seen",
+        "tokens_per_step",
+        "loss",
+        "grad_norm",
+        "lr",
+        "tok_per_sec",
+        "interval_seconds",
+        "elapsed_seconds",
+        "gpu_metrics",
+        "extra_metrics",
     }
 
 
@@ -92,11 +114,13 @@ def test_log_progress_derived_metrics_and_console_line(capsys):
     assert metrics["run/steps_per_epoch"] == 50
     assert metrics["run/total_steps"] == 100
     assert metrics["gpu/memory_used_gib"] == 1.5
+    assert metrics["train/grad_norm_max"] == 1.25
 
     # The terminal console line is unchanged in shape and formatting.
     line = capsys.readouterr().out.strip()
     assert line == (
-        "step 10 | tokens 640 | loss 1.2346 | lr 5.00e-04 | tok/s 11,464"
+        "step 10 | tokens 640 | loss 1.2346 | lr 5.00e-04 | "
+        "tok/s 11,464 | gn 0.500"
     )
 
 
@@ -113,9 +137,7 @@ def test_log_evaluation_logs_the_full_result(tmp_path, capsys):
     assert metrics["val/ppl"] == pytest.approx(math.exp(2.5))
     assert metrics["val/stderr"] == pytest.approx(0.1)
     assert metrics["val/tokens"] == 128
-    assert capsys.readouterr().out.strip() == (
-        "eval | step 12 | val loss 2.5000"
-    )
+    assert capsys.readouterr().out.strip() == ("eval | step 12 | val loss 2.5000")
 
 
 def test_log_evaluation_terminal_line_only_in_terminal_mode(tmp_path, capsys):
@@ -167,8 +189,14 @@ def test_start_forwards_run_info(tmp_path):
     from training.log_backend import RunInfo
 
     info = RunInfo(
-        name="exp", config={}, saved_config=None, resumed_run_id=None,
-        computed={}, stage_marker={}, parameter_metrics={}, step=0,
+        name="exp",
+        config={},
+        saved_config=None,
+        resumed_run_id=None,
+        computed={},
+        stage_marker={},
+        parameter_metrics={},
+        step=0,
     )
     tracker.start(info)
     assert logger.init_calls == [info]
@@ -177,8 +205,13 @@ def test_start_forwards_run_info(tmp_path):
 def test_record_checkpoint_updates_manifest(tmp_path):
     tracker, _ = _tracker(tmp_path)
     tracker.record_checkpoint(
-        "periodic", "step_7.pt", step=7, tokens_seen=448,
-        stage="stage-1-stable", best_val_loss=1.5, wandb_run_id=None,
+        "periodic",
+        "step_7.pt",
+        step=7,
+        tokens_seen=448,
+        stage="stage-1-stable",
+        best_val_loss=1.5,
+        wandb_run_id=None,
     )
     manifest = json.loads((tmp_path / "run_manifest.json").read_text())
     entry = manifest["checkpoints"]["step_7.pt"]
@@ -199,8 +232,12 @@ def test_record_checkpoint_failure_never_raises(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(tracking_module, "upsert_manifest", _boom)
     tracker, _ = _tracker(tmp_path)
     tracker.record_checkpoint(
-        "latest", "latest.pt", step=1, tokens_seen=64,
-        stage="stage-1-stable", best_val_loss=float("inf"),
+        "latest",
+        "latest.pt",
+        step=1,
+        tokens_seen=64,
+        stage="stage-1-stable",
+        best_val_loss=float("inf"),
         wandb_run_id=None,
     )  # must not raise
     assert "Warning: failed to update the run manifest" in capsys.readouterr().out
@@ -210,6 +247,4 @@ def test_log_checkpoint_artifact_forwards_metadata(tmp_path):
     tracker, logger = _tracker(tmp_path)
     metadata = {"kind": "best", "step": 42}
     tracker.log_checkpoint_artifact("best", "best-checkpoint", "/x/best.pt", metadata)
-    assert logger.checkpoints == [
-        ("best", "best-checkpoint", "/x/best.pt", metadata)
-    ]
+    assert logger.checkpoints == [("best", "best-checkpoint", "/x/best.pt", metadata)]

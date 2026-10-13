@@ -176,7 +176,7 @@ rewind the training stream.
 | `training.device` | `cuda` | Requested device, normally `cuda` or `cpu`. If CUDA is unavailable, the trainer automatically falls back to CPU. |
 | `training.compile` | `false` | Enable `torch.compile` on CUDA. Compilation is skipped on CPU. The first run can spend extra time compiling. |
 | `training.compile_mode` | `default` | Mode passed to `torch.compile`, such as `default` or another mode supported by the installed PyTorch version. |
-| `training.use_bf16` | `false` | Use CUDA BF16 autocast for forward/evaluation work while keeping model parameters in FP32. Requires a BF16-capable GPU; it is disabled on CPU and errors on unsupported CUDA hardware. |
+| `training.use_bf16` | `false` | Cast model parameters to BF16 and use CUDA BF16 autocast for forward/evaluation work. Requires a BF16-capable GPU; it is disabled on CPU and errors on unsupported CUDA hardware. |
 | `training.use_tensor_cores` | `false` | Enable TF32 matmuls for eligible CUDA devices (compute capability 8.0+). This trades some numerical precision for throughput. |
 | `training.log_backend` | `wandb` | `wandb` logs metrics and samples to Weights & Biases; `terminal` prints samples and evaluation summaries locally. `term` and `console` are aliases for `terminal`. |
 | `training.upload_artifacts` | `false` | Upload full checkpoint files to W&B as artifacts when `training.log_backend=wandb`. Local checkpoints are always written; enable this only when remote checkpoint copies are wanted. |

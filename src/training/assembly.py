@@ -76,9 +76,7 @@ def capture_rng_state() -> dict:
         "python": random.getstate(),
         "numpy": np.random.get_state(),
         "torch": torch.get_rng_state(),
-        "cuda": (
-            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-        ),
+        "cuda": (torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None),
     }
 
 
@@ -102,9 +100,7 @@ def resolve_runtime(cfg, checkpoint) -> _Runtime:
     assembly only reads its existence to pick the save dir (P9).
     """
     set_seed(cfg.training.seed)
-    device = torch.device(
-        cfg.training.device if torch.cuda.is_available() else "cpu"
-    )
+    device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
     use_bf16 = bool(getattr(cfg.training, "use_bf16", False))
     use_tensor_cores = bool(getattr(cfg.training, "use_tensor_cores", False))
     use_compile = bool(getattr(cfg.training, "compile", False))
@@ -216,22 +212,23 @@ def build_model(cfg, checkpoint, runtime: _Runtime):
     # TODO: replace with a factory that dispatches on cfg.model.name
     # (gpt2/moe/qwen)
     model = GptModel(model_cfg)
+
     if checkpoint is not None:
         restore_model(model, checkpoint)
+
     model.to(runtime.device)
+
+    if runtime.use_bf16:
+        model.to(torch.bfloat16)
 
     if runtime.use_compile:
         if runtime.device.type == "cuda":
             print(f"Compiling model with mode={runtime.compile_mode}")
             # Load the plain module first; compiled wrappers can add
             # ``_orig_mod`` prefixes to state-dict keys.
-            model = cast(
-                GptModel, torch.compile(model, mode=runtime.compile_mode)
-            )
+            model = cast(GptModel, torch.compile(model, mode=runtime.compile_mode))
         else:
-            print(
-                "Compilation requested, but CUDA is unavailable; skipping compile."
-            )
+            print("Compilation requested, but CUDA is unavailable; skipping compile.")
 
     metrics = get_model_parameter_metrics(model)
     _print_model_summary(model_cfg, metrics)
@@ -284,9 +281,7 @@ def build_data(cfg, model, checkpoint, runtime: _Runtime):
         runtime.device,
         max_tokens=train_limit_tokens,
     )
-    physical_batches = (
-        len(train_loader.data) - 1
-    ) // train_loader.batch_tokens
+    physical_batches = (len(train_loader.data) - 1) // train_loader.batch_tokens
     available_steps_per_pass = max(1, physical_batches // accum_steps)
     val_loader = MemmapDataLoader(data_dir, "eval", batch_size, seq_len, runtime.device)
     if len(train_loader) == 0:
@@ -302,12 +297,8 @@ def build_data(cfg, model, checkpoint, runtime: _Runtime):
     # accum_steps tokens.
     steps_per_pass = max(1, len(train_loader) // accum_steps)
 
-    decay_params = [
-        p for p in model.parameters() if p.requires_grad and p.ndim >= 2
-    ]
-    nodecay_params = [
-        p for p in model.parameters() if p.requires_grad and p.ndim < 2
-    ]
+    decay_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
+    nodecay_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
     optim_groups = [
         {"params": decay_params, "weight_decay": float(cfg.training.weight_decay)},
         {"params": nodecay_params, "weight_decay": 0.0},
@@ -431,8 +422,9 @@ def build_loss_fn(model, cfg, runtime: _Runtime):
     )
 
 
-def build_evaluators(model, loss_fn, tokenizer, cfg, model_cfg, val_loader,
-                     device, use_bf16):
+def build_evaluators(
+    model, loss_fn, tokenizer, cfg, model_cfg, val_loader, device, use_bf16
+):
     """The periodic (batch-capped) evaluator, the once-at-completion full
     scan, and the sample generator. Generation settings come from a plain
     namespace (the generation config group proper arrives in T7.2).
@@ -452,9 +444,7 @@ def build_evaluators(model, loss_fn, tokenizer, cfg, model_cfg, val_loader,
     final_cap = getattr(cfg.training, "final_eval_max_tokens", None)
     final_num_batches = None
     if final_cap is not None:
-        cap_tokens = parse_token_budget(
-            final_cap, "training.final_eval_max_tokens"
-        )
+        cap_tokens = parse_token_budget(final_cap, "training.final_eval_max_tokens")
         if cap_tokens is None:
             raise ValueError(
                 "training.final_eval_max_tokens must be a token count "
@@ -489,8 +479,18 @@ def build_evaluators(model, loss_fn, tokenizer, cfg, model_cfg, val_loader,
     return evaluator, final_evaluator, sampler, autocast_ctx
 
 
-def build_tracker(cfg, checkpoint, budget, state, stage_label_str, runtime,
-                  model_metrics, train_loader, val_loader, logger=None):
+def build_tracker(
+    cfg,
+    checkpoint,
+    budget,
+    state,
+    stage_label_str,
+    runtime,
+    model_metrics,
+    train_loader,
+    val_loader,
+    logger=None,
+):
     """Initialize run tracking AFTER model, budget, and resume state
     (spec 5.11 — the first W&B-capable step; everything before it is
     side-effect free, P3). An injected ``logger`` (test seam) replaces
@@ -505,28 +505,28 @@ def build_tracker(cfg, checkpoint, budget, state, stage_label_str, runtime,
     # No trainer reference inside the tracker: everything it needs is
     # explicit (spec 5.7).
     tracker = RunTracker(
-        logger if logger is not None else create_logger(
-            backend, upload_artifacts=upload_artifacts
-        ),
+        logger
+        if logger is not None
+        else create_logger(backend, upload_artifacts=upload_artifacts),
         save_dir=runtime.save_dir,
         run_name=runtime.run_name,
         git_commit=git_commit(),
-        config_digest=config_digest(
-            OmegaConf.to_container(cfg, resolve=True)
-        ),
+        config_digest=config_digest(OmegaConf.to_container(cfg, resolve=True)),
         terminal=backend == "terminal",
     )
-    tracker.start(_build_run_info(
-        cfg=cfg,
-        checkpoint=checkpoint,
-        budget=budget,
-        state=state,
-        stage_label=stage_label_str,
-        run_name=runtime.run_name,
-        model_metrics=model_metrics,
-        train_loader=train_loader,
-        val_loader=val_loader,
-    ))
+    tracker.start(
+        _build_run_info(
+            cfg=cfg,
+            checkpoint=checkpoint,
+            budget=budget,
+            state=state,
+            stage_label=stage_label_str,
+            run_name=runtime.run_name,
+            model_metrics=model_metrics,
+            train_loader=train_loader,
+            val_loader=val_loader,
+        )
+    )
     # F3: persist the backend's run id into state BEFORE any checkpoint
     # save, so payloads carry it and a resume reuses the same W&B run
     # (resume='must'). Terminal backends report None and keep id-less.
@@ -535,8 +535,18 @@ def build_tracker(cfg, checkpoint, budget, state, stage_label_str, runtime,
     return tracker
 
 
-def _build_run_info(*, cfg, checkpoint, budget, state, stage_label, run_name,
-                    model_metrics, train_loader, val_loader) -> RunInfo:
+def _build_run_info(
+    *,
+    cfg,
+    checkpoint,
+    budget,
+    state,
+    stage_label,
+    run_name,
+    model_metrics,
+    train_loader,
+    val_loader,
+) -> RunInfo:
     """The run's identity for the tracker (explicit values; spec 5.7)."""
     stage_marker: dict[str, Any] = {"training_stage": stage_label}
     if budget.phase.stage == "decay":
@@ -702,23 +712,44 @@ def build_trainer(cfg, checkpoint=None, *, logger=None) -> Trainer:
     # 7. loss + evaluators + sampler.
     loss_fn = build_loss_fn(model, cfg, runtime)
     evaluator, final_evaluator, sampler, autocast_ctx = build_evaluators(
-        model, loss_fn, data.tokenizer, cfg, model_cfg,
-        data.val_loader, runtime.device, runtime.use_bf16,
+        model,
+        loss_fn,
+        data.tokenizer,
+        cfg,
+        model_cfg,
+        data.val_loader,
+        runtime.device,
+        runtime.use_bf16,
     )
     # 8. tracker (the first W&B-capable step) + checkpoint manager.
     #    One clock is shared between the loop's progress metering and the
     #    checkpoint before_save stamp.
     clock = RunClock(state.run_elapsed_seconds)
     tracker = build_tracker(
-        cfg, checkpoint, budget, state, stage_label_str, runtime,
-        model_metrics, data.train_loader, data.val_loader, logger=logger,
+        cfg,
+        checkpoint,
+        budget,
+        state,
+        stage_label_str,
+        runtime,
+        model_metrics,
+        data.train_loader,
+        data.val_loader,
+        logger=logger,
     )
     ckpt = build_ckpt_manager(
         runtime.save_dir,
         runtime.run_name,
-        model, model_cfg, cfg,
-        data.optimizer, scheduler, budget, state,
-        clock, data.train_loader, tracker,
+        model,
+        model_cfg,
+        cfg,
+        data.optimizer,
+        scheduler,
+        budget,
+        state,
+        clock,
+        data.train_loader,
+        tracker,
         stage_label_str,
     )
     # 9. the loop-only trainer (spec 5.12).

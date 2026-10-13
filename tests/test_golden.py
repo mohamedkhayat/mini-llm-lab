@@ -60,8 +60,7 @@ CHECKPOINT_KEYS_V4 = {
 def _progress_steps(out):
     """Parse {step: (loss, lr_string)} from terminal progress lines."""
     return {
-        int(m.group(1)): (float(m.group(2)), m.group(3))
-        for m in LINE.finditer(out)
+        int(m.group(1)): (float(m.group(2)), m.group(3)) for m in LINE.finditer(out)
     }
 
 
@@ -131,7 +130,9 @@ def test_resume_equivalence_stable(tiny_cfg, capsys):
 
     # Uninterrupted 8-step run.
     trainer_a, steps_a = _run(tiny_cfg, capsys)
-    weights_a = load_checkpoint(Path(trainer_a.ckpt.save_dir) / "final_model.pt")["model"]
+    weights_a = load_checkpoint(Path(trainer_a.ckpt.save_dir) / "final_model.pt")[
+        "model"
+    ]
     rng_a = _Rng()
     assert set(steps_a) == set(range(1, 9))
 
@@ -139,9 +140,7 @@ def test_resume_equivalence_stable(tiny_cfg, capsys):
     # the periodic file stays on disk; it is never modified after write).
     tiny_cfg.training.save_interval = 4
     trainer_b1, steps_b1 = _run(tiny_cfg, capsys)
-    assert [steps_b1[s][0] for s in range(1, 9)] == [
-        steps_a[s][0] for s in range(1, 9)
-    ]
+    assert [steps_b1[s][0] for s in range(1, 9)] == [steps_a[s][0] for s in range(1, 9)]
     split = Path(trainer_b1.ckpt.save_dir) / "step_4.pt"
     assert split.is_file()
     capsys.readouterr()
@@ -158,9 +157,9 @@ def test_resume_equivalence_stable(tiny_cfg, capsys):
     uninterrupted_losses = [steps_a[s][0] for s in range(5, 9)]
     assert resumed_losses == uninterrupted_losses
 
-    weights_b2 = load_checkpoint(
-        Path(trainer_b2.ckpt.save_dir) / "final_model.pt"
-    )["model"]
+    weights_b2 = load_checkpoint(Path(trainer_b2.ckpt.save_dir) / "final_model.pt")[
+        "model"
+    ]
     _assert_same_weights(weights_a, weights_b2)
 
     assert _Rng().equals(rng_a)

@@ -81,7 +81,7 @@ class MemmapDataLoader:
             yield self._get_batch()
 
     def state_dict(self):
-        return {"current_step" : self.current_step}
+        return {"current_step": self.current_step}
 
     def load_state_dict(self, state):
         self.current_step = state["current_step"]

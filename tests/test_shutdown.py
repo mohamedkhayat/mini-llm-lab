@@ -50,7 +50,8 @@ def test_second_signal_restores_handlers_then_uses_os_kill(monkeypatch):
     still raises KeyboardInterrupt without it."""
     order = []
     monkeypatch.setattr(
-        os, "kill",
+        os,
+        "kill",
         lambda pid, signum: order.append(("kill", pid, signum)),
     )
     real_signal = signal.signal

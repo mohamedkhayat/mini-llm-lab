@@ -85,9 +85,7 @@ def test_final_eval_cap_converts_to_a_batch_budget(make_trainer):
             "final_eval_max_tokens": "512",
         }
     )
-    assert suffixed.final_evaluator._num_batches == 512 // (
-        BATCH_SIZE * SEQ_LEN
-    )
+    assert suffixed.final_evaluator._num_batches == 512 // (BATCH_SIZE * SEQ_LEN)
 
     # make_trainer mutates one shared cfg: reset the cap explicitly for
     # the uncapped case.

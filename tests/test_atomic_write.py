@@ -99,9 +99,7 @@ def test_restore_model_still_strips_the_orig_mod_prefix():
     """Checkpoints written by the current code may carry the torch.compile
     ``_orig_mod.`` prefix; it is stripped before the strict load."""
     model = nn.Linear(4, 4, bias=False)
-    prefixed = {
-        f"_orig_mod.{k}": v for k, v in model.state_dict().items()
-    }
+    prefixed = {f"_orig_mod.{k}": v for k, v in model.state_dict().items()}
 
     restore_model(model, {"model_state_dict": prefixed})
 

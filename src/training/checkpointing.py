@@ -225,10 +225,9 @@ def check_resume_consistency(
             "not resumable with this trainer. Start a fresh run instead."
         )
     if int(saved_steps_per_pass) != int(steps_per_pass):
-        phase_cap_is_intentional = (
-            available_steps_per_pass is not None
-            and int(available_steps_per_pass) >= int(saved_steps_per_pass)
-        )
+        phase_cap_is_intentional = available_steps_per_pass is not None and int(
+            available_steps_per_pass
+        ) >= int(saved_steps_per_pass)
         if not (
             allow_capacity_growth
             and (

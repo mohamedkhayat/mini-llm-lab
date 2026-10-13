@@ -51,9 +51,9 @@ def test_restore_training_state_restores_scalars_and_rng_only():
     assert state.tokens_seen == 448
     assert state.run_elapsed_seconds == 12.0
     assert state.wandb_run_id == "run-x"
-    assert torch.equal(
-        torch.get_rng_state(), torch.tensor(0) * 0 + 0
-    ) or True  # RNG is process-global; equality is covered by the suite's
+    assert (
+        torch.equal(torch.get_rng_state(), torch.tensor(0) * 0 + 0) or True
+    )  # RNG is process-global; equality is covered by the suite's
     # resume-equivalence tests — here we only pin the scalar contract.
 
 

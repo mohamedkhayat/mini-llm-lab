@@ -56,8 +56,7 @@ def _as_decimal(value, field: str) -> Decimal:
         return number * _SUFFIX_SCALE[match.group("suffix").lower()]
 
     raise ValueError(
-        f"{field} must be a plain integer or a value such as 1.2b/100m; "
-        f"got {value!r}"
+        f"{field} must be a plain integer or a value such as 1.2b/100m; got {value!r}"
     )
 
 
@@ -79,7 +78,9 @@ def parse_token_budget(value, field: str, *, allow_none: bool = True) -> int | N
         raise ValueError(f"{field} must be non-negative; got {value!r}")
     integral_value = decimal_value.to_integral_value(rounding=ROUND_FLOOR)
     if decimal_value != integral_value:
-        raise ValueError(f"{field} must resolve to a whole number of tokens; got {value!r}")
+        raise ValueError(
+            f"{field} must resolve to a whole number of tokens; got {value!r}"
+        )
     return int(integral_value)
 
 
@@ -111,8 +112,7 @@ def minimum_cache_tokens(required_train_tokens: int, val_ratio: float) -> int:
     required_train_tokens = int(required_train_tokens)
     if required_train_tokens < 0:
         raise ValueError(
-            "required train tokens must be non-negative; "
-            f"got {required_train_tokens}"
+            f"required train tokens must be non-negative; got {required_train_tokens}"
         )
     if required_train_tokens == 0:
         return 0
@@ -132,7 +132,10 @@ def minimum_cache_tokens(required_train_tokens: int, val_ratio: float) -> int:
     )
     while split_cache_tokens(candidate, ratio)[0] < required_train_tokens:
         candidate += 1
-    while candidate > 0 and split_cache_tokens(candidate - 1, ratio)[0] >= required_train_tokens:
+    while (
+        candidate > 0
+        and split_cache_tokens(candidate - 1, ratio)[0] >= required_train_tokens
+    ):
         candidate -= 1
     return candidate
 

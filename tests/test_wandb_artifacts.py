@@ -275,7 +275,8 @@ def test_first_checkpoint_payload_carries_the_wandb_run_id(tiny_cfg):
     assert trainer.state.wandb_run_id == "abc123"
     ckpt = torch.load(
         Path(trainer.ckpt.save_dir) / "latest.pt",
-        map_location="cpu", weights_only=False,
+        map_location="cpu",
+        weights_only=False,
     )
     assert ckpt["wandb_run_id"] == "abc123"
 
@@ -291,7 +292,8 @@ def test_resume_reuses_the_saved_wandb_run_id(tiny_cfg):
     trainer.train()
     ckpt = torch.load(
         Path(trainer.ckpt.save_dir) / "final_model.pt",
-        map_location="cpu", weights_only=False,
+        map_location="cpu",
+        weights_only=False,
     )
     assert ckpt["wandb_run_id"] == "abc123"
 
@@ -322,6 +324,7 @@ def test_terminal_backend_keeps_wandb_run_id_none(tiny_cfg):
     assert trainer.state.wandb_run_id is None
     ckpt = torch.load(
         Path(trainer.ckpt.save_dir) / "final_model.pt",
-        map_location="cpu", weights_only=False,
+        map_location="cpu",
+        weights_only=False,
     )
     assert ckpt["wandb_run_id"] is None

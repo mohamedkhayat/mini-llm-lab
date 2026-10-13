@@ -118,9 +118,7 @@ def prepare_dataset(cfg, num_proc=8, preserve_prefix=False):
     train_arr = np.memmap(
         train_tmp_path, dtype=dtype, mode="w+", shape=(train_arr_len,)
     )
-    val_arr = np.memmap(
-        eval_tmp_path, dtype=dtype, mode="w+", shape=(val_arr_len,)
-    )
+    val_arr = np.memmap(eval_tmp_path, dtype=dtype, mode="w+", shape=(val_arr_len,))
     idx = 0
 
     current_arr = train_arr

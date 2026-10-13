@@ -15,6 +15,7 @@ MODEL_VOCAB = 32
 
 def _tiny_model():
     from omegaconf import OmegaConf
+
     cfg = OmegaConf.create(
         {
             "name": "gpt2",
@@ -139,5 +140,7 @@ def test_generate_top_k_support_and_oversized_k(monkeypatch):
     support = {1, 2, 3}
     generated = out[:, 2:].flatten().tolist()
     assert len(generated) == 2 * 20
-    assert set(generated) <= support, f"sampled outside top-k: {set(generated) - support}"
+    assert set(generated) <= support, (
+        f"sampled outside top-k: {set(generated) - support}"
+    )
     assert 1 in generated  # the dominant logit must have been sampled

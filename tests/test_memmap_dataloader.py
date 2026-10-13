@@ -40,9 +40,7 @@ def make_data_dir(
 
 
 def make_loader(data_dir, split="train", batch_size=2, block_size=3, device="cpu"):
-    return MemmapDataLoader(
-        data_dir, split, batch_size, block_size, device
-    )
+    return MemmapDataLoader(data_dir, split, batch_size, block_size, device)
 
 
 def test_first_batch_is_a_contiguous_window_with_shifted_targets(tmp_path):

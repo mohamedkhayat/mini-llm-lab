@@ -116,7 +116,9 @@ def test_stop_flag_between_steps_writes_latest_and_logs_the_interrupt(make_train
         {"eval_interval": 999, "train_tokens": 10 * TOKENS_PER_STEP}
     )
     trainer.train_loader = StoppingLoader(
-        trainer.train_loader, trainer, trip_after=8  # 4 steps x 2 micro-batches
+        trainer.train_loader,
+        trainer,
+        trip_after=8,  # 4 steps x 2 micro-batches
     )
 
     trainer.train()
@@ -141,7 +143,9 @@ def test_stop_mid_pull_keeps_the_cursor_consistent_with_the_step(make_trainer):
         {"eval_interval": 999, "train_tokens": 10 * TOKENS_PER_STEP}
     )
     trainer.train_loader = StoppingLoader(
-        trainer.train_loader, trainer, trip_after=8  # trips inside a pull
+        trainer.train_loader,
+        trainer,
+        trip_after=8,  # trips inside a pull
     )
 
     trainer.train()
@@ -156,7 +160,9 @@ def test_stop_mid_pull_keeps_the_cursor_consistent_with_the_step(make_trainer):
         "state": {"current_step": 8},
     }
     check_cursor_consistency(
-        trainer.state, trainer.train_loader, trainer.accum_steps,
+        trainer.state,
+        trainer.train_loader,
+        trainer.accum_steps,
         trainer.budget.phase,
     )
 
@@ -174,9 +180,7 @@ def test_stop_mid_pull_then_resume_matches_uninterrupted_run(make_trainer):
     trainer, _ = make_trainer(
         {"eval_interval": 999, "train_tokens": 10 * TOKENS_PER_STEP}
     )
-    trainer.train_loader = StoppingLoader(
-        trainer.train_loader, trainer, trip_after=8
-    )
+    trainer.train_loader = StoppingLoader(trainer.train_loader, trainer, trip_after=8)
     trainer.train()
     assert trainer.state.step == 4
 
@@ -195,9 +199,7 @@ def test_stop_mid_pull_then_resume_matches_uninterrupted_run(make_trainer):
         )
 
 
-def test_stop_mid_pull_then_resume_exhausts_the_file_without_ran_out(
-    make_trainer
-):
+def test_stop_mid_pull_then_resume_exhausts_the_file_without_ran_out(make_trainer):
     """F2: a one-pass budget that fills the file exactly (62 steps x 2
     micro-batches = 124 = the whole tiny train file). Pre-F2 the
     discarded pull skipped 2 batches, so the resumed run hit
@@ -205,9 +207,7 @@ def test_stop_mid_pull_then_resume_exhausts_the_file_without_ran_out(
     trainer, _ = make_trainer(
         {"eval_interval": 999, "train_tokens": 62 * TOKENS_PER_STEP}
     )
-    trainer.train_loader = StoppingLoader(
-        trainer.train_loader, trainer, trip_after=8
-    )
+    trainer.train_loader = StoppingLoader(trainer.train_loader, trainer, trip_after=8)
     trainer.train()
     assert trainer.state.step == 4
 
@@ -322,6 +322,7 @@ def test_save_interval_writes_periodic_step_checkpoints_and_latest(make_trainer)
         "state": {"current_step": 16},
     }
 
+
 def test_resume_starts_from_the_saved_batch_position(make_trainer):
     """A resumed run continues from the loader's saved position (not from
     the top of the file) and runs to the budget without rescan: with the
@@ -402,9 +403,7 @@ def test_cpu_run_with_bf16_requested_enters_no_autocast(make_trainer):
     warns on every call when CUDA is unavailable), so a full run stays
     clean with that warning escalated to an error."""
     with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "error", message=".*CUDA is not available.*"
-        )
+        warnings.filterwarnings("error", message=".*CUDA is not available.*")
         trainer, _ = make_trainer(
             {
                 "use_bf16": True,

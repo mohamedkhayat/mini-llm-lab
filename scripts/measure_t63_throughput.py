@@ -37,7 +37,9 @@ TRAIN_TOKENS, EVAL_TOKENS = 13_000, 512
 data_dir = OUT / "data" / "smoke" / "gpt2"
 data_dir.mkdir(parents=True, exist_ok=True)
 rng = np.random.default_rng(42)
-rng.integers(1, VOCAB, size=TRAIN_TOKENS).astype(np.uint16).tofile(data_dir / "train.bin")
+rng.integers(1, VOCAB, size=TRAIN_TOKENS).astype(np.uint16).tofile(
+    data_dir / "train.bin"
+)
 rng.integers(1, VOCAB, size=EVAL_TOKENS).astype(np.uint16).tofile(data_dir / "eval.bin")
 json.dump(
     {

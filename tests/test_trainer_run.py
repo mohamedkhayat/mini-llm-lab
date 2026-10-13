@@ -48,9 +48,7 @@ def test_param_groups_split_on_ndim(tiny_cfg):
     # trainable param population (trainer.model is an untyped god-class
     # attribute; comparing ndim histograms makes the partition exact).
     reference = GptModel(tiny_cfg.model)
-    ref_hist = Counter(
-        p.ndim for p in reference.parameters() if p.requires_grad
-    )
+    ref_hist = Counter(p.ndim for p in reference.parameters() if p.requires_grad)
     decay_hist = Counter(p.ndim for p in decay["params"])
     nodecay_hist = Counter(p.ndim for p in nodecay["params"])
 
@@ -117,7 +115,9 @@ def test_stop_never_mid_accumulation(tiny_cfg, monkeypatch):
     # step 1 and the checkpoint landed there.
     assert trainer.state.step == 1
     ckpt = torch.load(
-        Path(trainer.ckpt.save_dir) / "latest.pt", map_location="cpu", weights_only=False
+        Path(trainer.ckpt.save_dir) / "latest.pt",
+        map_location="cpu",
+        weights_only=False,
     )
     assert ckpt["step"] == 1
     assert not (Path(trainer.ckpt.save_dir) / "final_model.pt").exists()

@@ -10,9 +10,9 @@ def test_matching_resume_budget_is_accepted():
         total_steps=60,
         saved_steps_per_pass=40,
         steps_per_pass=40,
-                    saved_tokens_per_step=16,
-            tokens_per_step=16,
-            decay_run=False,
+        saved_tokens_per_step=16,
+        tokens_per_step=16,
+        decay_run=False,
     )
 
 
@@ -23,7 +23,7 @@ def test_non_decay_resume_with_different_total_budget_is_rejected():
             total_steps=100,
             saved_steps_per_pass=40,
             steps_per_pass=40,
-                        saved_tokens_per_step=16,
+            saved_tokens_per_step=16,
             tokens_per_step=16,
             decay_run=False,
         )
@@ -37,9 +37,9 @@ def test_decay_run_budget_mismatch_is_accepted():
         total_steps=100,
         saved_steps_per_pass=40,
         steps_per_pass=40,
-                    saved_tokens_per_step=16,
-            tokens_per_step=16,
-            decay_run=True,
+        saved_tokens_per_step=16,
+        tokens_per_step=16,
+        decay_run=True,
     )
 
 
@@ -49,9 +49,9 @@ def test_stable_continuation_budget_mismatch_is_accepted():
         total_steps=91,
         saved_steps_per_pass=40,
         steps_per_pass=40,
-                    saved_tokens_per_step=16,
-            tokens_per_step=16,
-            decay_run=False,
+        saved_tokens_per_step=16,
+        tokens_per_step=16,
+        decay_run=False,
         continuation_run=True,
     )
 
@@ -63,7 +63,7 @@ def test_steps_per_pass_mismatch_is_rejected_even_for_decay_runs():
             total_steps=100,
             saved_steps_per_pass=40,
             steps_per_pass=80,
-                        saved_tokens_per_step=16,
+            saved_tokens_per_step=16,
             tokens_per_step=16,
             decay_run=True,
         )

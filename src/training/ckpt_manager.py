@@ -45,10 +45,16 @@ class RunIdentity(NamedTuple):
 
 
 class CheckpointManager:
-    def __init__(self, save_dir, snapshot_fn, identity: RunIdentity, tracker,
-                 before_save: Callable[[], None] | None = None,
-                 stage_label: str | None = None,
-                 artifact_metadata: Callable | None = None):
+    def __init__(
+        self,
+        save_dir,
+        snapshot_fn,
+        identity: RunIdentity,
+        tracker,
+        before_save: Callable[[], None] | None = None,
+        stage_label: str | None = None,
+        artifact_metadata: Callable | None = None,
+    ):
         self._save_dir = Path(save_dir)
         self._snapshot_fn = snapshot_fn
         self._identity = identity
@@ -99,8 +105,7 @@ class CheckpointManager:
         elif kind == "best":
             self._write_primary("best.pt", payload)
             self._record(state, "best", "best.pt")
-            self._artifact("best", "best-checkpoint",
-                           str(self._save_dir / "best.pt"))
+            self._artifact("best", "best-checkpoint", str(self._save_dir / "best.pt"))
         elif kind == "periodic":
             filename = f"step_{state.step}.pt"
             self._write_primary(filename, payload)
@@ -112,8 +117,9 @@ class CheckpointManager:
             self._publish_latest("final_model.pt")
             self._record(state, "final", "final_model.pt", final_eval=final_eval)
             self._record(state, "latest", "latest.pt")
-            self._artifact("final", "final-model",
-                           str(self._save_dir / "final_model.pt"))
+            self._artifact(
+                "final", "final-model", str(self._save_dir / "final_model.pt")
+            )
         else:
             raise ValueError(f"unknown checkpoint kind: {kind!r}")
 

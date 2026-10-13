@@ -62,9 +62,7 @@ def test_warmup_resume(tiny_cfg, tmp_path, capsys):
         )
 
 
-def test_old_checkpoint_without_warmup_steps_still_resumes(
-    tiny_cfg, tmp_path, capsys
-):
+def test_old_checkpoint_without_warmup_steps_still_resumes(tiny_cfg, tmp_path, capsys):
     """A checkpoint whose wsd entry has no ``warmup_steps`` key (written
     before this ticket) resumes via the historical rule: warmup is
     recomputed from the relaunch config's warmup_fraction."""
@@ -116,10 +114,17 @@ def test_phase_budget_carries_warmup_steps_in_as_dict():
     # F9: the default is the None sentinel (resumes, decay runs, fresh
     # runs before resolution); resolve_budget fills it for fresh stable
     # starts and as_dict persists None as null.
-    assert PhaseBudget(
-        mode="one_pass", stage="stable", start_step=0, target_step=None,
-        requested_tokens=None, effective_tokens=None,
-    ).warmup_steps is None
+    assert (
+        PhaseBudget(
+            mode="one_pass",
+            stage="stable",
+            start_step=0,
+            target_step=None,
+            requested_tokens=None,
+            effective_tokens=None,
+        ).warmup_steps
+        is None
+    )
 
 
 def test_one_pass_resume_uses_the_persisted_warmup_steps(
@@ -165,9 +170,7 @@ def test_one_pass_resume_uses_the_persisted_warmup_steps(
     # (int(0.5 * 62) = 31) must win over the new fraction (0.2 -> 12).
     tiny_cfg.training.warmup_fraction = 0.2
     tiny_cfg.training.save_interval = None
-    resumed = build_trainer(
-        tiny_cfg, checkpoint=load_checkpoint(Path(latest[0]))
-    )
+    resumed = build_trainer(tiny_cfg, checkpoint=load_checkpoint(Path(latest[0])))
     resumed.train()
     resumed_lrs = _lrs(capsys.readouterr().out)
 

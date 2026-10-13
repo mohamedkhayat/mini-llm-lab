@@ -17,24 +17,44 @@ def _sha(path):
 
 class _RecordingTracker:
     def __init__(self):
-        self.records = []      # (kind, filename, kwargs)
-        self.artifacts = []    # (kind, name, metadata)
+        self.records = []  # (kind, filename, kwargs)
+        self.artifacts = []  # (kind, name, metadata)
 
-    def record_checkpoint(self, kind, filename, *, step, tokens_seen, stage,
-                          best_val_loss, wandb_run_id, final_eval=None):
-        self.records.append((kind, filename, dict(
-            step=step, tokens_seen=tokens_seen, stage=stage,
-            best_val_loss=best_val_loss, wandb_run_id=wandb_run_id,
-            final_eval=final_eval,
-        )))
+    def record_checkpoint(
+        self,
+        kind,
+        filename,
+        *,
+        step,
+        tokens_seen,
+        stage,
+        best_val_loss,
+        wandb_run_id,
+        final_eval=None,
+    ):
+        self.records.append(
+            (
+                kind,
+                filename,
+                dict(
+                    step=step,
+                    tokens_seen=tokens_seen,
+                    stage=stage,
+                    best_val_loss=best_val_loss,
+                    wandb_run_id=wandb_run_id,
+                    final_eval=final_eval,
+                ),
+            )
+        )
 
     def log_checkpoint_artifact(self, kind, name, path, metadata):
         self.artifacts.append((kind, name, metadata))
 
 
 def _make_manager(tmp_path, tracker, state, before_save=None):
-    identity = RunIdentity(run_name="run", git_commit="deadbeef",
-                           config_digest="cfg123")
+    identity = RunIdentity(
+        run_name="run", git_commit="deadbeef", config_digest="cfg123"
+    )
     snapshot = lambda: {"step": state.step, "blob": b"x" * 4096}  # noqa: E731
     return CheckpointManager(
         str(tmp_path), snapshot, identity, tracker, before_save=before_save
@@ -73,14 +93,20 @@ def test_ckpt_policy_table(tmp_path):
         ("periodic", "step_7.pt"),
         ("latest", "latest.pt"),
     ]
-    assert [a[0:2] for a in tracker.artifacts] == [("best", "best-checkpoint")]  # no new artifact
+    assert [a[0:2] for a in tracker.artifacts] == [
+        ("best", "best-checkpoint")
+    ]  # no new artifact
 
     mgr.save("final", state)
     assert _files(tmp_path) == {
-        "latest.pt", "best.pt", "step_7.pt", "final_model.pt",
+        "latest.pt",
+        "best.pt",
+        "step_7.pt",
+        "final_model.pt",
     }
     assert [r[0:2] for r in tracker.records[-2:]] == [
-        ("final", "final_model.pt"), ("latest", "latest.pt"),
+        ("final", "final_model.pt"),
+        ("latest", "latest.pt"),
     ]
     assert tracker.artifacts[-1][0:2] == ("final", "final-model")
 

@@ -34,8 +34,7 @@ def validate_resume_data_identity(cfg, checkpoint):
         raise ValueError(
             "Cannot resume safely: the checkpoint data identity changed; "
             "restarting from a different token stream would invalidate the "
-            "saved cursor. "
-            + "; ".join(mismatches)
+            "saved cursor. " + "; ".join(mismatches)
         )
 
 
@@ -58,7 +57,9 @@ def is_dataset_valid(data_dir, cfg):
             print("tokenizer changed in config. Re tokenizing...")
             return False
 
-        needed_total = parse_token_budget(cfg.data.max_tokens, "data.max_tokens", allow_none=False)
+        needed_total = parse_token_budget(
+            cfg.data.max_tokens, "data.max_tokens", allow_none=False
+        )
         val_ratio = float(cfg.data.val_ratio)
         needed_train, needed_val = split_cache_tokens(needed_total, val_ratio)
 
@@ -93,7 +94,11 @@ def is_dataset_valid(data_dir, cfg):
             and val_bin.stat().st_size == int(cached_val) * dtype_size
         )
 
-        if not metadata_matches or cached_train < needed_train or cached_val < needed_val:
+        if (
+            not metadata_matches
+            or cached_train < needed_train
+            or cached_val < needed_val
+        ):
             print(
                 f"Cache metadata/capacity is incompatible: has "
                 f"{cached_train:,} train / {cached_val:,} val tokens, "
@@ -143,9 +148,7 @@ def prepare_cache_for_run(cfg, checkpoint=None):
         "legacy_decay",
     }
     if required_train is not None and required_train > requested_train:
-        required_total = minimum_cache_tokens(
-            required_train, float(cfg.data.val_ratio)
-        )
+        required_total = minimum_cache_tokens(required_train, float(cfg.data.val_ratio))
         if not can_expand:
             raise ValueError(
                 f"{phase_budget.mode} requires {required_train:,} train tokens, "
@@ -168,5 +171,3 @@ def prepare_cache_for_run(cfg, checkpoint=None):
     if not is_dataset_valid(data_dir, cfg):
         prepare_dataset(cfg, preserve_prefix=checkpoint is not None)
     return phase_budget
-
-

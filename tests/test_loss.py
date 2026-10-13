@@ -37,7 +37,9 @@ def test_flce_fallback_on_cpu(capsys):
 
     out = capsys.readouterr().out
     assert "FLCE" in out and "Falling back" in out
-    assert "liger_kernel" not in sys.modules, "Liger must stay unimported on the fallback path"
+    assert "liger_kernel" not in sys.modules, (
+        "Liger must stay unimported on the fallback path"
+    )
 
     x = torch.randint(0, 32, (2, 6))
     y = torch.randint(0, 32, (2, 6))

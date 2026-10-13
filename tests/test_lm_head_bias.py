@@ -97,9 +97,7 @@ def test_checkpoint_with_orig_mod_prefixed_bias_loads(tiny_cfg, tmp_path):
     """Compiled-wrapper checkpoints carry _orig_mod.-prefixed keys; the
     inference must strip the prefix before deciding."""
     biased = GptModel(_tiny_model_cfg(lm_head_bias=True))
-    state = {
-        f"_orig_mod.{key}": value for key, value in biased.state_dict().items()
-    }
+    state = {f"_orig_mod.{key}": value for key, value in biased.state_dict().items()}
     checkpoint = {
         "model": state,
         "model_cfg": {

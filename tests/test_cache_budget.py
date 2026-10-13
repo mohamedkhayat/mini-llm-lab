@@ -9,6 +9,7 @@ from data.budget import minimum_cache_tokens, split_cache_tokens
 from data.cache import is_dataset_valid, prepare_cache_for_run
 from data.prepare import _verify_prefix_preserved
 
+
 def make_cfg(*, max_tokens="1k", val_ratio=0.1, start_decay=False):
     return SimpleNamespace(
         data=SimpleNamespace(

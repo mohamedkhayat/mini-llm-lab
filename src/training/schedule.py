@@ -121,7 +121,9 @@ def _saved_phase_budget(
                 "The checkpoint carries an unknown WSD stage; cannot resume "
                 f"safely: {stage!r}"
             )
-        start_step = int(saved_wsd.get("start_step", saved_step if stage == "decay" else 0))
+        start_step = int(
+            saved_wsd.get("start_step", saved_step if stage == "decay" else 0)
+        )
         requested_tokens = saved_wsd.get("requested_tokens")
         effective_tokens = saved_wsd.get("effective_tokens")
         if effective_tokens is None:
@@ -133,9 +135,7 @@ def _saved_phase_budget(
         if stage == "decay":
             decay_start = int(decay_start if decay_start is not None else saved_step)
             decay_steps = int(
-                decay_steps
-                if decay_steps is not None
-                else target_step - decay_start
+                decay_steps if decay_steps is not None else target_step - decay_start
             )
         # F9: an explicit null (the unresolved sentinel persisted by
         # as_dict) counts as absent and falls back to the historical rule.
@@ -146,9 +146,7 @@ def _saved_phase_budget(
             # fresh stable start (stage stable, start step 0).
             is_fresh_stable_start = stage == "stable" and start_step == 0
             warmup_steps = (
-                int(warmup_fraction * int(target_step))
-                if is_fresh_stable_start
-                else 0
+                int(warmup_fraction * int(target_step)) if is_fresh_stable_start else 0
             )
         return PhaseBudget(
             mode=str(saved_wsd.get("mode", "checkpoint")),
@@ -194,9 +192,8 @@ def resolve_phase_budget(training_cfg, checkpoint, tokens_per_step: int) -> Phas
         # crash must continue the original cosine endpoint.  A saved stable
         # phase, however, is intentionally overridable by the manual
         # start_decay trigger.
-        decay_is_active = (
-            saved_budget.stage == "decay"
-            and resume_step < (saved_budget.target_step or 0)
+        decay_is_active = saved_budget.stage == "decay" and resume_step < (
+            saved_budget.target_step or 0
         )
         if decay_is_active or not start_decay:
             # An unfinished stable continuation resumes its saved endpoint.
@@ -279,8 +276,7 @@ def resolve_phase_budget(training_cfg, checkpoint, tokens_per_step: int) -> Phas
                 warmup_steps = int(saved_warmup)
             else:
                 warmup_steps = int(
-                    float(getattr(training_cfg, "warmup_fraction", 0.0))
-                    * saved_total
+                    float(getattr(training_cfg, "warmup_fraction", 0.0)) * saved_total
                 )
             return PhaseBudget(
                 mode="exact_resume",
@@ -417,19 +413,13 @@ def resolve_budget(
     continuation_run = phase.mode == "stable_continue"
     decay_run = phase.stage == "decay"
 
-    total_steps = (
-        phase.target_step if phase.target_step is not None else steps_per_pass
-    )
+    total_steps = phase.target_step if phase.target_step is not None else steps_per_pass
     budget_name = _BUDGET_NAMES.get(phase.mode, phase.mode)
 
     # F9: fill the sentinel only — an explicit value (including 0) is
     # respected; phases that keep None (decay, continuations) persist null
     # and resume as warmup 0.
-    if (
-        phase.stage == "stable"
-        and phase.start_step == 0
-        and phase.warmup_steps is None
-    ):
+    if phase.stage == "stable" and phase.start_step == 0 and phase.warmup_steps is None:
         phase = replace(
             phase,
             warmup_steps=int(

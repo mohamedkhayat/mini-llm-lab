@@ -95,5 +95,3 @@ def test_memmap_resume_is_silent(capsys):
 
     assert capsys.readouterr().out == ""
     assert loader.current_step == 4
-
-

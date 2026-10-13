@@ -36,7 +36,9 @@ def _mean_loss_fn(x, y):
 def _evaluator(batches, num_batches=None):
     # A real (empty) module: eval_mode needs the .training flag.
     return Evaluator(
-        model=torch.nn.Module(), loss_fn=_mean_loss_fn, loader=_Loader(batches),
+        model=torch.nn.Module(),
+        loss_fn=_mean_loss_fn,
+        loader=_Loader(batches),
         num_batches=num_batches,
     )
 
@@ -68,8 +70,9 @@ def test_eval_num_batches_caps_the_scan():
     """num_batches limits the scan (the periodic-eval budget); None scans
     the whole split."""
     loader = _Loader([_batch(4, 1.0), _batch(4, 3.0), _batch(4, 5.0)])
-    capped = _evaluator([b for b in [_batch(4, 1.0), _batch(4, 3.0), _batch(4, 5.0)]],
-                        num_batches=2).run()
+    capped = _evaluator(
+        [b for b in [_batch(4, 1.0), _batch(4, 3.0), _batch(4, 5.0)]], num_batches=2
+    ).run()
     assert capped.loss == pytest.approx(2.0)
     assert capped.tokens == 8
 

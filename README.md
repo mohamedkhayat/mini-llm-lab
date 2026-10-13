@@ -176,7 +176,7 @@ rewind the training stream.
 | `training.device` | `cuda` | Requested device, normally `cuda` or `cpu`. If CUDA is unavailable, the trainer automatically falls back to CPU. |
 | `training.compile` | `false` | Enable `torch.compile` on CUDA. Compilation is skipped on CPU. The first run can spend extra time compiling. |
 | `training.compile_mode` | `default` | Mode passed to `torch.compile`, such as `default` or another mode supported by the installed PyTorch version. |
-| `training.use_bf16` | `false` | Use CUDA BF16 autocast for forward/evaluation work. Requires a BF16-capable GPU; it is disabled on CPU and errors on unsupported CUDA hardware. |
+| `training.use_bf16` | `false` | Use CUDA BF16 autocast for forward/evaluation work while keeping model parameters in FP32. Requires a BF16-capable GPU; it is disabled on CPU and errors on unsupported CUDA hardware. |
 | `training.use_tensor_cores` | `false` | Enable TF32 matmuls for eligible CUDA devices (compute capability 8.0+). This trades some numerical precision for throughput. |
 | `training.log_backend` | `wandb` | `wandb` logs metrics and samples to Weights & Biases; `terminal` prints samples and evaluation summaries locally. `term` and `console` are aliases for `terminal`. |
 | `training.upload_artifacts` | `false` | Upload full checkpoint files to W&B as artifacts when `training.log_backend=wandb`. Local checkpoints are always written; enable this only when remote checkpoint copies are wanted. |
@@ -228,19 +228,19 @@ its selected phase-1 budget.
 | `model.gated` | `false` | Use a gated SwiGLU-style feed-forward: a second upcast projection multiplies the activated hidden stream elementwise. |
 | `model.equalize_params` | `true` | When `gated=true`, shrink the hidden width by two-thirds so the gated FFN has roughly the ungated parameter count. |
 | `model.ffn_bias` | `false` | Add bias terms to the feed-forward linear layers. |
-| `model.position_embedding` | `absolute` | Position-encoding label. The active GPT implementation uses learned absolute positional embeddings; RoPE is not yet dispatched. |
+| `model.position_embedding` | `absolute` | Position encoding: learned absolute embeddings (`absolute`) or rotary positional embeddings (`rope`). |
 | `model.residual_style` | `serial` | Residual-layout label. The active transformer block uses serial pre-norm residual connections. |
 | `model.logit_softcap` | `null` | Reserved config field; not currently applied by the GPT implementation. |
-| `model.rope_theta` | `null` | Reserved RoPE parameter; not used while absolute positional embeddings are active. |
+| `model.rope_theta` | `10000` | RoPE base frequency, used when `model.position_embedding=rope`; ignored with absolute embeddings. |
+| `model.qk_norm` | `false` | Apply RMSNorm independently to each query and key head before attention. |
 | `model.temperature` | `1.0` | Temperature for periodic sample generation. Positive values sample from the distribution; `0` or a negative value uses greedy argmax. |
 | `model.top_k` | `25` | Restrict periodic sample generation to the top K logits. Set `null` to disable top-k filtering. |
 
 The `moe` preset also contains `num_experts`,
 `num_experts_per_token`, and `shared_expert` fields. They describe planned
 Mixture-of-Experts behavior but are not consumed by the current `GptModel`.
-The Qwen-style preset's RMSNorm and gated SiLU feed-forward are active, while
-its `rope`/`rope_theta` settings are metadata only. GQA is available when
-`model.attention=gqa`, but the current Qwen preset still selects `mha`. Use
+The Qwen-style preset's RMSNorm, gated SiLU feed-forward, and RoPE are active.
+GQA is available when `model.attention=gqa`, but the current Qwen preset still selects `mha`. Use
 `model=gpt2` for the supported end-to-end training path until a model factory
 is added.
 
@@ -478,11 +478,12 @@ it does not create a second copy of the data.
 ## Outputs
 
 - W&B metrics include training/validation loss, perplexity, learning rate,
-  throughput, generated text samples, and model parameter counts. When W&B is
+  throughput, gradient norms and per-layer/per-group gradient diagnostics,
+  GPU memory, generated text samples, and model parameter counts. When W&B is
   the backend and `training.upload_artifacts=true`, `best.pt` and
   `final_model.pt` are additionally uploaded to the run page as artifacts.
 - Terminal logging includes model parameter counts, training/evaluation loss,
-  learning rate, and generated sample text.
+  gradient norm, learning rate, throughput, and generated sample text.
 - Hydra stores run metadata and checkpoints under `runs/`. Each run directory
   also holds `run_manifest.json`, mapping every checkpoint file to the W&B
   run id/URL with per-save stats (see **Two-stage WSD training**).

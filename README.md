@@ -1,6 +1,6 @@
 # mini-llm-lab
 
-A modular PyTorch implementation for building and pretraining decoder-only transformers. It provides standalone modules for attention variants, feed-forward blocks, tokenized binary caching, and a two-stage warmup-stable-decay (WSD) training loop.
+Pretrain decoder-only language models from scratch in PyTorch. Intentionally single-GPU and built for inspection and experimentation: every component is written cleanly from the ground up, ready to be modified directly in source or reconfigured via Hydra overrides. When throughput matters, drop-in toggles allow you to swap in optimized kernels and paths, including PyTorch SDPA, torch.compile, and Liger Kernel fused cross-entropy.
 
 ---
 

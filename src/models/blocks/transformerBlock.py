@@ -39,6 +39,9 @@ class TransformerBlock(nn.Module):
             cfg.n_heads,
             cfg.n_kv_heads,
             cfg.qkv_bias,
+            getattr(cfg, "qk_norm", False),
+            cfg.position_embedding == "rope",
+            cfg.rope_theta,
         )
         self.ffn = FeedForward(cfg)
         self.dropout = nn.Dropout(cfg.drop_rate)

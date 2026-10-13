@@ -19,6 +19,7 @@ equalize_params: true
 position_embedding: absolute
 residual_style: serial
 logit_softcap: null
-rope_theta: null
+rope_theta: 10000
 temperature : 1.0
 top_k : 25
+qk_norm : false

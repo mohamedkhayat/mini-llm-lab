@@ -13,7 +13,13 @@ class GptModel(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.emb_dim)
-        self.pos_emb = nn.Embedding(cfg.context_length, cfg.emb_dim)
+
+        self.context_length = cfg.context_length
+
+        if not cfg.position_embedding == "rope":
+            self.pos_emb = nn.Embedding(cfg.context_length, cfg.emb_dim)
+        else:
+            self.pos_emb = None
         self.dropout = nn.Dropout(cfg.drop_rate)
 
         self.trf_blocks = nn.Sequential(
@@ -31,31 +37,34 @@ class GptModel(nn.Module):
         self.lm_head = nn.Linear(
             cfg.emb_dim, cfg.vocab_size, bias=bool(getattr(cfg, "lm_head_bias", False))
         )
-        
+
         self.tie_embeddings = bool(getattr(cfg, "tie_embeddings", False))
         if self.tie_embeddings:
             self.lm_head.weight = self.tok_emb.weight
-        
+
         self.apply(self._init_weights)
 
         for pn, p in self.named_parameters():
-            if pn.endswith("c_proj.weight"):
+            if pn.endswith("out_proj.weight"):
                 torch.nn.init.normal_(
                     p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layers)
                 )
-        
+
     def forward(self, x, return_logits=True):
         # x : B X SEQ_LEN
         _, seq_len = x.shape
-        if seq_len > self.pos_emb.num_embeddings:
+        if seq_len > self.context_length:
             raise ValueError(
                 f"sequence length {seq_len} exceeds model context length "
-                f"{self.pos_emb.num_embeddings}"
+                f"{self.context_length}"
             )
 
         tok_embs = self.tok_emb(x)
-        pos_embs = self.pos_emb(torch.arange(seq_len, device=x.device))
-        x = tok_embs + pos_embs
+        if self.pos_emb is not None:
+            pos_embs = self.pos_emb(torch.arange(seq_len, device=x.device))
+            x = tok_embs + pos_embs
+        else:
+            x = tok_embs
         x = self.dropout(x)
         x = self.trf_blocks(x)
         x = self.final_norm(x)
@@ -64,7 +73,6 @@ class GptModel(nn.Module):
             return self.lm_head(x)
 
         return x
-
 
     def generate(
         self,
@@ -80,7 +88,9 @@ class GptModel(nn.Module):
             autocast_context = nullcontext()
         vocab_size = self.lm_head.out_features
         # [B] mask of rows that have hit EOS; they stay pinned at eos_id.
-        done = torch.zeros(token_idx.shape[0], dtype=torch.bool, device=token_idx.device)
+        done = torch.zeros(
+            token_idx.shape[0], dtype=torch.bool, device=token_idx.device
+        )
         for _ in range(max_new_tokens):
             idx_cond = token_idx[:, -context_length:]
             with torch.no_grad(), autocast_context:
@@ -99,9 +109,7 @@ class GptModel(nn.Module):
                 next_token_idx = torch.argmax(logits, dim=-1, keepdim=True)
 
             if eos_id is not None:
-                next_token_idx = torch.where(
-                    done.unsqueeze(-1), eos_id, next_token_idx
-                )
+                next_token_idx = torch.where(done.unsqueeze(-1), eos_id, next_token_idx)
                 done = done | (next_token_idx.squeeze(-1) == eos_id)
                 if done.all():
                     token_idx = torch.cat((token_idx, next_token_idx), dim=-1)
@@ -115,6 +123,5 @@ class GptModel(nn.Module):
             torch.nn.init.normal_(m.weight, mean=0.0, std=0.02)
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Embedding):
-                torch.nn.init.normal_(m.weight, mean=0.0, std=0.02)
-                
+        elif isinstance(m, nn.Embedding):
+            torch.nn.init.normal_(m.weight, mean=0.0, std=0.02)

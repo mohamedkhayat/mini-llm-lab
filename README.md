@@ -30,7 +30,9 @@ python train.py model=gpt2 model.normalization=rmsnorm model.position_embedding=
 Requires Python 3.12+ and PyTorch.
 
 ```bash
-# Install
+# Clone and install
+git clone https://github.com/mohamedkhayat/mini-llm-lab.git
+cd mini-llm-lab
 pip install -e '.[dev]'
 
 # Start training (Default: CUDA, W&B logging)

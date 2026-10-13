@@ -176,16 +176,15 @@ class WandbLogger(RunLogger):
             "model_parameters_non_trainable": parameter_metrics[
                 "model/parameters_non_trainable"
             ],
-            "model_parameter_memory_mb": parameter_metrics[
-                "model/parameter_memory_mb"
-            ],
+            "model_parameter_memory_mb": parameter_metrics["model/parameter_memory_mb"],
         }
         if resumed_run_id is not None:
             # A resumed run keeps its restored original config values; W&B
             # raises ConfigError if update() changes an existing value.
             existing = dict(self._wandb.config.items())
             payload = {
-                k: v for k, v in payload.items()
+                k: v
+                for k, v in payload.items()
                 if k not in existing or existing[k] == v
             }
         self._wandb.config.update(payload)

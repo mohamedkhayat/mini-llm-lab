@@ -188,6 +188,7 @@ class Trainer:
                 interval_seconds=0.0,
                 elapsed_seconds=self.state.run_elapsed_seconds,
                 gpu_metrics={},
+                extra_metrics={}
             )
         )
         self.ckpt.save("final", self.state, final_eval=final_result)

@@ -8,6 +8,7 @@ peak RSS 762 MiB. T6.3 must stay within +/-2%.
 """
 
 import json
+import os
 import resource
 import sys
 import time
@@ -25,7 +26,7 @@ from omegaconf import OmegaConf
 torch.cuda.is_available = lambda: False
 torch.cuda.device_count = lambda: 0
 
-from training.assembly import build_trainer
+from training.assembly import build_trainer  # noqa: E402 -- after the CUDA stub above
 
 OUT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/tmp/t63-throughput")
 OUT.mkdir(parents=True, exist_ok=True)
@@ -118,7 +119,6 @@ cfg = OmegaConf.create(
     }
 )
 
-import os
 
 os.chdir(OUT)
 trainer = build_trainer(cfg)  # construction excluded from the timing

@@ -30,3 +30,7 @@ pythonpath = ["src"]
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.ruff.lint]
+# Pin the rule set explicitly: newer ruff releases widen the defaults.
+select = ["E4", "E7", "E9", "F"]

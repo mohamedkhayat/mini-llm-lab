@@ -17,11 +17,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/ruff-action@v3
         with:
-          version: "0.17.3"
+          version: "0.14.6"
           args: check src tests scripts/smoke_cache.py figs/readme train.py chat.py
       - uses: astral-sh/ruff-action@v3
         with:
-          version: "0.17.3"
+          version: "0.14.6"
           args: format --check src tests scripts/smoke_cache.py figs/readme train.py chat.py
 
   test:
@@ -53,6 +53,12 @@ jobs:
     env:
       WANDB_MODE: disabled
       CUDA_VISIBLE_DEVICES: ""
+      SMOKE: >-
+        data.hf_dataset=smoke data.max_tokens=7040
+        model.emb_dim=128 model.n_heads=4 model.n_layers=2 model.context_length=128
+        data.seq_len=128 training.batch_size=2 training.accum_steps=1
+        training.device=cpu training.eval_interval=20 training.eval_batches=2
+        training.max_new_tokens=2 training.log_backend=terminal
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -66,6 +72,17 @@ jobs:
           pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
           pip install -e '.[dev]'
       - name: Build smoke token cache
-        run: SMOKE_CACHE_CMD
-      - name: Train
-        run: SMOKE_TRAIN_CMD
+        run: python scripts/smoke_cache.py
+      - name: "Stage 1: stable phase with periodic checkpoints"
+        run: |
+          python train.py $SMOKE training.train_tokens=4096 training.save_interval=10 \
+            hydra.run.dir=smoke-run
+          test -f smoke-run/final_model.pt
+          test -f smoke-run/step_10.pt
+      - name: "Stage 2: resume and decay"
+        run: |
+          python train.py $SMOKE training.train_tokens=4096 \
+            training.resume_from=smoke-run/latest.pt \
+            training.start_decay=true training.decay_tokens=1024 \
+            hydra.run.dir=smoke-run/decay
+          grep -q stage-2-decay smoke-run/run_manifest.json

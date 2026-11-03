@@ -65,7 +65,8 @@ chainlit run chat.py                     # chat UI over saved checkpoints
 ```
 
 Fast CPU smoke test before any real run (no GPU / no W&B; write the tiny
-`data/smoke/gpt2` cache first — one-liner in the README's smoke section):
+`data/smoke/gpt2` cache first with `python scripts/smoke_cache.py`; CI runs the
+same pipeline in `.github/workflows/ci.yml`):
 
 ```bash
 WANDB_MODE=disabled CUDA_VISIBLE_DEVICES="" python train.py \

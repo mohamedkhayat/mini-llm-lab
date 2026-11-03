@@ -1,6 +1,5 @@
 """T1.2: eval_mode is exception-safe (P8)."""
 
-import torch
 import torch.nn as nn
 
 from training.evaluator import eval_mode

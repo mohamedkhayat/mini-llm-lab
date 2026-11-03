@@ -43,7 +43,11 @@ def _decay(start, d, **overrides):
 def test_log_backend_can_be_selected_for_terminal_output():
     assert resolve_log_backend(SimpleNamespace(log_backend="terminal")) == "terminal"
     assert resolve_log_backend(SimpleNamespace(log_backend="term")) == "terminal"
-    assert resolve_log_backend(SimpleNamespace(log_backend="wandb")) == "wandb"
+    # pin the mode: a WANDB_MODE=disabled environment (CI) would force terminal
+    assert (
+        resolve_log_backend(SimpleNamespace(log_backend="wandb"), wandb_mode="online")
+        == "wandb"
+    )
 
 
 def test_disabled_wandb_mode_falls_back_to_terminal():

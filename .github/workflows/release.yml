@@ -1,0 +1,36 @@
+name: Release
+
+# Push a tag like v0.2.0 -> run the tests, build sdist + wheel, publish a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install (CPU PyTorch)
+        run: |
+          python -m pip install --upgrade pip build
+          pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install -e '.[dev]'
+      - name: Test
+        env:
+          WANDB_MODE: disabled
+          CUDA_VISIBLE_DEVICES: ""
+        run: pytest -q
+      - name: Build
+        run: python -m build
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag

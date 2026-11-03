@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from training.run_manifest import (
     MANIFEST_NAME,

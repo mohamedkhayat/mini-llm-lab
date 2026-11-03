@@ -119,8 +119,7 @@ def test_log_progress_derived_metrics_and_console_line(capsys):
     # The terminal console line is unchanged in shape and formatting.
     line = capsys.readouterr().out.strip()
     assert line == (
-        "step 10 | tokens 640 | loss 1.2346 | lr 5.00e-04 | "
-        "tok/s 11,464 | gn 0.500"
+        "step 10 | tokens 640 | loss 1.2346 | lr 5.00e-04 | tok/s 11,464 | gn 0.500"
     )
 
 

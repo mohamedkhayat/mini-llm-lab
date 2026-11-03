@@ -61,7 +61,6 @@ def _verify_prefix_preserved(old_path, new_path, dtype_name):
 
 
 def prepare_dataset(cfg, num_proc=8, preserve_prefix=False):
-
     output_dir = get_data_dir(cfg)
     output_dir.mkdir(parents=True, exist_ok=True)
 

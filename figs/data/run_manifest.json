@@ -1,0 +1,168 @@
+{
+  "checkpoints": {
+    "best.pt": {
+      "best_val_loss": 3.026015281677246,
+      "file": "best.pt",
+      "kind": "best",
+      "stage": "stage-2-decay",
+      "step": 22500,
+      "timestamp": "2026-10-14T22:50:27Z",
+      "tokens_seen": 11796480000,
+      "wandb_run_id": "hgi0v79p",
+      "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+    },
+    "final_model.pt": {
+      "best_val_loss": 3.026015281677246,
+      "file": "final_model.pt",
+      "final_eval": {
+        "loss": 2.7582952976226807,
+        "tokens": 1366622208
+      },
+      "kind": "final",
+      "stage": "stage-2-decay",
+      "step": 22814,
+      "timestamp": "2026-10-15T00:02:04Z",
+      "tokens_seen": 11961106432,
+      "wandb_run_id": "hgi0v79p",
+      "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+    },
+    "latest.pt": {
+      "best_val_loss": 3.026015281677246,
+      "file": "latest.pt",
+      "kind": "latest",
+      "stage": "stage-2-decay",
+      "step": 22814,
+      "timestamp": "2026-10-15T00:02:04Z",
+      "tokens_seen": 11961106432,
+      "wandb_run_id": "hgi0v79p",
+      "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+    },
+    "step_10000.pt": {
+      "best_val_loss": 3.273698091506958,
+      "file": "step_10000.pt",
+      "kind": "periodic",
+      "stage": "stage-1-stable",
+      "step": 10000,
+      "timestamp": "2026-10-14T04:28:00Z",
+      "tokens_seen": 5242880000,
+      "wandb_run_id": "hgi0v79p",
+      "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+    },
+    "step_12000.pt": {
+      "best_val_loss": 3.2555391788482666,
+      "file": "step_12000.pt",
+      "kind": "periodic",
+      "stage": "stage-1-stable",
+      "step": 12000,
+      "timestamp": "2026-10-14T06:28:54Z",
+      "tokens_seen": 6291456000,
+      "wandb_run_id": "hgi0v79p",
+      "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+    },
+    "step_14000.pt": {
+      "best_val_loss": 3.2194204330444336,
+      "file": "step_14000.pt",
+      "kind": "periodic",
+      "stage": "stage-1-stable",
+      "step": 14000,
+      "timestamp": "2026-10-14T08:30:04Z",
+      "tokens_seen": 7340032000,
+      "wandb_run_id": "hgi0v79p",
+      "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+    },
+    "step_16000.pt": {
+      "best_val_loss": 3.218447685241699,
+      "file": "step_16000.pt",
+      "kind": "periodic",
+      "stage": "stage-1-stable",
+      "step": 16000,
+      "timestamp": "2026-10-14T10:32:30Z",
+      "tokens_seen": 8388608000,
+      "wandb_run_id": "hgi0v79p",
+      "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+    },
+    "step_18000.pt": {
+      "best_val_loss": 3.188737392425537,
+      "file": "step_18000.pt",
+      "kind": "periodic",
+      "stage": "stage-1-stable",
+      "step": 18000,
+      "timestamp": "2026-10-14T12:34:35Z",
+      "tokens_seen": 9437184000,
+      "wandb_run_id": "hgi0v79p",
+      "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+    },
+    "step_2000.pt": {
+      "best_val_loss": 3.8519811630249023,
+      "file": "step_2000.pt",
+      "kind": "periodic",
+      "stage": "stage-1-stable",
+      "step": 2000,
+      "timestamp": "2026-10-13T20:22:10Z",
+      "tokens_seen": 1048576000,
+      "wandb_run_id": "hgi0v79p",
+      "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+    },
+    "step_20000.pt": {
+      "best_val_loss": 3.148057222366333,
+      "file": "step_20000.pt",
+      "kind": "periodic",
+      "stage": "stage-2-decay",
+      "step": 20000,
+      "timestamp": "2026-10-14T20:15:32Z",
+      "tokens_seen": 10485760000,
+      "wandb_run_id": "hgi0v79p",
+      "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+    },
+    "step_22000.pt": {
+      "best_val_loss": 3.0390961170196533,
+      "file": "step_22000.pt",
+      "kind": "periodic",
+      "stage": "stage-2-decay",
+      "step": 22000,
+      "timestamp": "2026-10-14T22:19:28Z",
+      "tokens_seen": 11534336000,
+      "wandb_run_id": "hgi0v79p",
+      "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+    },
+    "step_4000.pt": {
+      "best_val_loss": 3.523047685623169,
+      "file": "step_4000.pt",
+      "kind": "periodic",
+      "stage": "stage-1-stable",
+      "step": 4000,
+      "timestamp": "2026-10-13T22:24:30Z",
+      "tokens_seen": 2097152000,
+      "wandb_run_id": "hgi0v79p",
+      "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+    },
+    "step_6000.pt": {
+      "best_val_loss": 3.377429485321045,
+      "file": "step_6000.pt",
+      "kind": "periodic",
+      "stage": "stage-1-stable",
+      "step": 6000,
+      "timestamp": "2026-10-14T00:25:44Z",
+      "tokens_seen": 3145728000,
+      "wandb_run_id": "hgi0v79p",
+      "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+    },
+    "step_8000.pt": {
+      "best_val_loss": 3.305689573287964,
+      "file": "step_8000.pt",
+      "kind": "periodic",
+      "stage": "stage-1-stable",
+      "step": 8000,
+      "timestamp": "2026-10-14T02:26:55Z",
+      "tokens_seen": 4194304000,
+      "wandb_run_id": "hgi0v79p",
+      "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+    }
+  },
+  "config_digest": "12cda8a69eeb3d8f",
+  "git_commit": "44582a5ccd795b2ddaaab59f021b63e49b9c0783",
+  "run_name": "mini_llm",
+  "updated_at": "2026-10-15T00:02:04Z",
+  "wandb_run_id": "hgi0v79p",
+  "wandb_url": "https://wandb.ai/mohamedkhayat025-none/mini-llm-lab/runs/hgi0v79p"
+}

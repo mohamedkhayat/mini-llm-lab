@@ -19,6 +19,8 @@ def make_model_config(**overrides):
         "drop_rate": 0.0,
         "qkv_bias": False,
         "attention": "mha",
+        "position_embedding": "absolute",
+        "rope_theta": 10000,
         "ff_mult": 2,
         "hidden_dim": 32,
         "activation": "gelu",

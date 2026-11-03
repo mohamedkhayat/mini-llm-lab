@@ -1,9 +1,7 @@
 """T4.1: CheckpointManager — the single home of the save policy table."""
 
 import hashlib
-import json
 import os
-from pathlib import Path
 
 import pytest
 import torch

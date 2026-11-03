@@ -69,7 +69,6 @@ def test_eval_equal_batches_matches_manual_mean():
 def test_eval_num_batches_caps_the_scan():
     """num_batches limits the scan (the periodic-eval budget); None scans
     the whole split."""
-    loader = _Loader([_batch(4, 1.0), _batch(4, 3.0), _batch(4, 5.0)])
     capped = _evaluator(
         [b for b in [_batch(4, 1.0), _batch(4, 3.0), _batch(4, 5.0)]], num_batches=2
     ).run()

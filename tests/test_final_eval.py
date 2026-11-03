@@ -9,7 +9,6 @@ scan.
 import json
 from pathlib import Path
 
-import pytest
 
 from conftest import BATCH_SIZE, SEQ_LEN, TOKENS_PER_STEP
 from training.checkpointing import load_checkpoint

@@ -39,7 +39,6 @@ def validate_resume_data_identity(cfg, checkpoint):
 
 
 def is_dataset_valid(data_dir, cfg):
-
     train_bin, val_bin, meta_json = (
         data_dir / "train.bin",
         data_dir / "eval.bin",

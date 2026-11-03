@@ -70,7 +70,7 @@ def test_old_checkpoint_without_warmup_steps_still_resumes(tiny_cfg, tmp_path, c
     tiny_cfg.training.warmup_fraction = 0.5
     tiny_cfg.training.save_interval = 2
     tiny_cfg.training.log_interval = 1
-    reference = _run(tiny_cfg, capsys)
+    _run(tiny_cfg, capsys)  # writes step_2.pt
 
     import glob
 

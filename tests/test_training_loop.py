@@ -374,7 +374,9 @@ def test_train_loss_is_the_interval_mean(make_trainer):
     it = iter(known)
 
     def stub_train_step(micro_batches):
-        return torch.tensor(next(it)), torch.tensor(1.0)
+        loss = torch.tensor(next(it))
+        trainer.grad_monitor.add([loss])  # report() needs recorded steps
+        return loss, torch.tensor(1.0)
 
     trainer.train_step = stub_train_step
     trainer.train()

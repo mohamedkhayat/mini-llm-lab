@@ -30,7 +30,6 @@ import shutil
 from pathlib import Path
 from typing import Callable, NamedTuple
 
-import torch
 
 from training.checkpointing import atomic_torch_save
 from training.run_manifest import fsync_dir

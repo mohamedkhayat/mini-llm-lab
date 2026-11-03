@@ -233,3 +233,12 @@ checkpoints/
 .pi/
 TODO.md
 LEARNING_LOG.md
+
+# Dotfiles / dotfolders (editor, agent and tool state); keep the repo's own
+.*
+!.gitignore
+!.gitkeep
+!.github/
+
+# Remotion video project and renders
+video/

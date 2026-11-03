@@ -29,9 +29,9 @@ LINE = re.compile(
 
 # Golden trajectory: first 6 steps of a fresh 6-step run, seed 42, CPU/fp32,
 # tiny_cfg defaults + train_tokens=6*64, warmup_fraction=0.5, log_interval=1.
-# Recorded 2026-10-09 from the T0.1-fixed code (the pre-refactor baseline).
+# Re-recorded 2026-11-03 after the weight-initialization change (10150b9).
 # LR is the .2e-formatted string (3-step linear warmup to 5e-4).
-GOLDEN_LOSSES = [5.7827, 5.619, 5.7772, 5.6959, 5.7679, 5.773]
+GOLDEN_LOSSES = [5.5389, 5.5344, 5.5387, 5.547, 5.5525, 5.5705]
 GOLDEN_LRS = ["3.33e-04", "5.00e-04", "5.00e-04", "5.00e-04", "5.00e-04", "5.00e-04"]
 
 # The v4 checkpoint payload key set (spec section 5.8: unchanged by the
